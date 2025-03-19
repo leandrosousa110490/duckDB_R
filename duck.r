@@ -18,6 +18,10 @@ library(readr)
 library(readxl)
 library(arrow)
 library(magrittr)  # For the pipe operator
+library(esquisse)  # For interactive ggplot visualization
+library(prophet)   # For time series forecasting
+library(dplyr)     # For data manipulation
+library(lubridate) # For date/time handling
 
 # UI Definition
 ui <- fluidPage(
@@ -46,6 +50,34 @@ ui <- fluidPage(
       .ace_comment { color: #6A737D !important; font-style: italic; }
       .radiant-container { width: 100%; height: 800px; }
       .pivot-container { padding: 20px; }
+      .esquisse-container { height: 800px; overflow: hidden; }
+      .summary-stats { padding: 15px; background-color: #f9f9f9; border-radius: 5px; margin-bottom: 15px; }
+      .summary-value { font-size: 24px; font-weight: bold; color: #2c3e50; }
+      .summary-label { font-size: 14px; color: #7b8a8b; }
+      
+      /* Sidebar toggle button styles */
+      #sidebar-toggle-container {
+        position: fixed;
+        top: 60px;
+        left: 5px;
+        z-index: 1000;
+      }
+      .btn-sidebar-toggle {
+        border-radius: 50%;
+        width: 40px;
+        height: 40px;
+        padding: 0;
+        line-height: 40px;
+        text-align: center;
+        font-size: 16px;
+        background-color: #2c3e50;
+        color: white;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.3);
+      }
+      .btn-sidebar-toggle:hover {
+        background-color: #1a252f;
+        color: white;
+      }
     "))
   ),
   titlePanel(div(
@@ -54,337 +86,470 @@ ui <- fluidPage(
     style = "color: #2c3e50; font-weight: bold;"
   )),
   
-  sidebarLayout(
-    sidebarPanel(
-      # Database connection section
-      box(
-        width = 12,
-        title = "Database Connection", 
-        status = "primary", 
-        solidHeader = TRUE,
-        collapsible = TRUE,
+  tags$div(id = "sidebar-toggle-container",
+           actionButton("toggle_sidebar", "", 
+                        icon = icon("bars"), 
+                        class = "btn-sidebar-toggle",
+                        title = "Toggle Sidebar")
+  ),
+  
+  tags$script(HTML("
+    $(document).ready(function() {
+      $('#toggle_sidebar').on('click', function() {
+        $('#left-column').toggle('fast');
+        var mainWidth = $('#right-column').hasClass('col-sm-9') ? 12 : 9;
+        $('#right-column').toggleClass('col-sm-12 col-sm-9');
         
-        radioButtons("conn_type", "Connection Type:", 
-                     choices = c("In-Memory" = "memory", 
-                                 "File-based" = "file"),
-                     selected = "memory"),
-        conditionalPanel(
-          condition = "input.conn_type == 'file'",
-          div(
-            style = "display: flex; justify-content: space-between; align-items: center;",
-            textInput("db_path", "Database Path:", value = "my_database.duckdb", width = "80%"),
-            shinyFilesButton("file_select", "Browse", "Select DuckDB file", 
-                             multiple = FALSE, class = "btn-sm btn-info")
-          ),
-          checkboxInput("create_db", "Create if it doesn't exist", value = TRUE),
+        // Change the icon based on sidebar state
+        var icon = $('#left-column').is(':visible') ? 'fa-bars' : 'fa-chevron-right';
+        $('#toggle_sidebar i').removeClass('fa-bars fa-chevron-right').addClass(icon);
+      });
+    });
+  ")),
+  
+  fluidRow(
+    div(id = "left-column", class = "col-sm-3",
+        # Database connection section
+        box(
+          width = 12,
+          title = "Database Connection", 
+          status = "primary", 
+          solidHeader = TRUE,
+          collapsible = TRUE,
+          
+          radioButtons("conn_type", "Connection Type:", 
+                       choices = c("In-Memory" = "memory", 
+                                   "File-based" = "file"),
+                       selected = "memory"),
           conditionalPanel(
-            condition = "output.has_recent_connections == 'true'",
-            h5("Recent Connections:"),
-            uiOutput("recent_connections")
-          )
-        ),
-        div(
-          style = "display: flex; justify-content: space-between;",
-          actionButton("connect_btn", "Connect", icon = icon("plug"), 
-                       class = "btn-success"),
-          actionButton("disconnect_btn", "Disconnect", icon = icon("unlink"), 
-                       class = "btn-danger")
-        ),
-        textOutput("connection_status")
-      ),
-      
-      # Database explorer section
-      box(
-        width = 12,
-        title = "Database Explorer", 
-        status = "info", 
-        solidHeader = TRUE,
-        collapsible = TRUE,
-        div(id = "database_explorer", 
-            uiOutput("db_structure_ui")),
-        div(
-          style = "margin-top: 10px;",
-          actionButton("refresh_explorer_btn", "Refresh", icon = icon("sync"), 
-                       class = "btn-sm btn-info")
-        )
-      ),
-      
-      # Query input section
-      box(
-        width = 12,
-        title = "SQL Query", 
-        status = "primary", 
-        solidHeader = TRUE,
-        collapsible = TRUE,
-        
-        aceEditor(
-          outputId = "sql_query",
-          value = "SELECT * FROM sqlite_master;",
-          mode = "sql",
-          theme = "sqlserver",
-          height = "200px",
-          fontSize = 14,
-          autoComplete = "enabled",
-          highlightActiveLine = TRUE,
-          showLineNumbers = TRUE,
-          hotkeys = list(runKey = list(win = "Ctrl-Enter", mac = "Cmd-Enter")),
-          wordWrap = TRUE
-        ),
-        
-        div(
-          style = "display: flex; justify-content: space-between; align-items: center; margin-top: 10px;",
-          div(
-            style = "display: flex; align-items: center;",
-            checkboxInput("explain_query", "Explain Query Plan", value = FALSE),
-            span(style = "margin-left: 15px; color: #6c757d; font-size: 0.9em;", "Press Ctrl+Enter to run")
+            condition = "input.conn_type == 'file'",
+            div(
+              style = "display: flex; justify-content: space-between; align-items: center;",
+              textInput("db_path", "Database Path:", value = "my_database.duckdb", width = "80%"),
+              shinyFilesButton("file_select", "Browse", "Select DuckDB file", 
+                               multiple = FALSE, class = "btn-sm btn-info")
+            ),
+            checkboxInput("create_db", "Create if it doesn't exist", value = TRUE),
+            conditionalPanel(
+              condition = "output.has_recent_connections == 'true'",
+              h5("Recent Connections:"),
+              uiOutput("recent_connections")
+            )
           ),
           div(
-            style = "display: flex; justify-content: flex-end;",
-            actionButton("format_query_btn", "Format SQL", icon = icon("indent"), 
-                         class = "btn-sm btn-info", style = "margin-right: 10px;"),
-            actionButton("run_query_btn", "Run Query", icon = icon("play"), 
-                         class = "btn-primary")
+            style = "display: flex; justify-content: space-between;",
+            actionButton("connect_btn", "Connect", icon = icon("plug"), 
+                         class = "btn-success"),
+            actionButton("disconnect_btn", "Disconnect", icon = icon("unlink"), 
+                         class = "btn-danger")
+          ),
+          textOutput("connection_status")
+        ),
+        
+        # Database explorer section
+        box(
+          width = 12,
+          title = "Database Explorer", 
+          status = "info", 
+          solidHeader = TRUE,
+          collapsible = TRUE,
+          div(id = "database_explorer", 
+              uiOutput("db_structure_ui")),
+          div(
+            style = "margin-top: 10px;",
+            actionButton("refresh_explorer_btn", "Refresh", icon = icon("sync"), 
+                         class = "btn-sm btn-info")
           )
-        )
-      ),
-      
-      # Database tools section
-      box(
-        width = 12,
-        title = "Database Tools", 
-        status = "primary", 
-        solidHeader = TRUE,
-        collapsible = TRUE,
-        
-        div(
-          style = "display: flex; justify-content: space-between; margin-bottom: 10px;",
-          actionButton("list_tables_btn", "List Tables", icon = icon("list"), 
-                       class = "btn-sm btn-info"),
-          actionButton("show_schemas_btn", "Show Schemas", icon = icon("sitemap"), 
-                       class = "btn-sm btn-info")
-        ),
-        hr(),
-        # Data import
-        selectInput("import_file_type", "File Type:",
-                    choices = c("CSV" = "csv", 
-                                "Parquet" = "parquet", 
-                                "Excel" = "excel"),
-                    selected = "csv"),
-        
-        # Import options
-        conditionalPanel(
-          condition = "input.import_file_type == 'csv'",
-          fileInput("csv_file", "Import CSV File", 
-                    accept = c("text/csv", "text/comma-separated-values", ".csv")),
-          checkboxInput("csv_header", "First Row is Header", value = TRUE),
-          textInput("csv_delimiter", "Delimiter:", value = ",")
         ),
         
-        conditionalPanel(
-          condition = "input.import_file_type == 'parquet'",
-          fileInput("parquet_file", "Import Parquet File", 
-                    accept = c(".parquet"))
+        # Query input section
+        box(
+          width = 12,
+          title = "SQL Query", 
+          status = "primary", 
+          solidHeader = TRUE,
+          collapsible = TRUE,
+          
+          aceEditor(
+            outputId = "sql_query",
+            value = "SELECT * FROM sqlite_master;",
+            mode = "sql",
+            theme = "sqlserver",
+            height = "200px",
+            fontSize = 14,
+            autoComplete = "enabled",
+            highlightActiveLine = TRUE,
+            showLineNumbers = TRUE,
+            hotkeys = list(runKey = list(win = "Ctrl-Enter", mac = "Cmd-Enter")),
+            wordWrap = TRUE
+          ),
+          
+          div(
+            style = "display: flex; justify-content: space-between; align-items: center; margin-top: 10px;",
+            div(
+              style = "display: flex; align-items: center;",
+              checkboxInput("explain_query", "Explain Query Plan", value = FALSE),
+              span(style = "margin-left: 15px; color: #6c757d; font-size: 0.9em;", "Press Ctrl+Enter to run")
+            ),
+            div(
+              style = "display: flex; justify-content: flex-end;",
+              actionButton("format_query_btn", "Format SQL", icon = icon("indent"), 
+                           class = "btn-sm btn-info", style = "margin-right: 10px;"),
+              actionButton("run_query_btn", "Run Query", icon = icon("play"), 
+                           class = "btn-primary")
+            )
+          )
         ),
         
-        conditionalPanel(
-          condition = "input.import_file_type == 'excel'",
-          fileInput("excel_file", "Import Excel File", 
-                    accept = c(".xlsx", ".xls")),
-          checkboxInput("excel_header", "First Row is Header", value = TRUE),
-          textInput("excel_sheet", "Sheet Name (optional):", value = "")
+        # Database tools section
+        box(
+          width = 12,
+          title = "Database Tools", 
+          status = "primary", 
+          solidHeader = TRUE,
+          collapsible = TRUE,
+          
+          div(
+            style = "display: flex; justify-content: space-between; margin-bottom: 10px;",
+            actionButton("list_tables_btn", "List Tables", icon = icon("list"), 
+                         class = "btn-sm btn-info"),
+            actionButton("show_schemas_btn", "Show Schemas", icon = icon("sitemap"), 
+                         class = "btn-sm btn-info")
+          ),
+          hr(),
+          # Data import
+          selectInput("import_file_type", "File Type:",
+                      choices = c("CSV" = "csv", 
+                                  "Parquet" = "parquet", 
+                                  "Excel" = "excel"),
+                      selected = "csv"),
+          
+          # Import options
+          conditionalPanel(
+            condition = "input.import_file_type == 'csv'",
+            fileInput("csv_file", "Import CSV File", 
+                      accept = c("text/csv", "text/comma-separated-values", ".csv")),
+            checkboxInput("csv_header", "First Row is Header", value = TRUE),
+            textInput("csv_delimiter", "Delimiter:", value = ",")
+          ),
+          
+          conditionalPanel(
+            condition = "input.import_file_type == 'parquet'",
+            fileInput("parquet_file", "Import Parquet File", 
+                      accept = c(".parquet"))
+          ),
+          
+          conditionalPanel(
+            condition = "input.import_file_type == 'excel'",
+            fileInput("excel_file", "Import Excel File", 
+                      accept = c(".xlsx", ".xls")),
+            checkboxInput("excel_header", "First Row is Header", value = TRUE),
+            textInput("excel_sheet", "Sheet Name (optional):", value = "")
+          ),
+          
+          textInput("table_name", "Import As Table:", value = "imported_data"),
+          
+          div(
+            style = "display: flex; justify-content: center;",
+            actionButton("import_btn", "Import Data", icon = icon("file-import"), 
+                         class = "btn-sm btn-primary")
+          )
         ),
-        
-        textInput("table_name", "Import As Table:", value = "imported_data"),
-        
-        div(
-          style = "display: flex; justify-content: center;",
-          actionButton("import_btn", "Import Data", icon = icon("file-import"), 
-                       class = "btn-sm btn-primary")
-        )
-      ),
-      width = 3
+        width = 3
     ),
     
-    mainPanel(
-      tabsetPanel(
-        id = "main_tabs",
-        tabPanel("Results", 
-                 box(
-                   width = 12,
-                   verbatimTextOutput("query_status"),
-                   hr(),
-                   div(
-                     style = "display: flex; justify-content: space-between; margin-bottom: 10px;",
+    div(id = "right-column", class = "col-sm-9",
+        tabsetPanel(
+          id = "main_tabs",
+          tabPanel("Results", 
+                   box(
+                     width = 12,
+                     verbatimTextOutput("query_status"),
+                     hr(),
                      div(
-                       style = "display: flex; gap: 10px;",
-                       downloadButton("download_results", "Download Results"),
-                       actionButton("clear_btn", "Clear Results", icon = icon("eraser"), 
-                                    class = "btn-warning")
-                     ),
-                     div(
-                       selectInput("results_page_length", "Rows per page:", 
-                                   choices = c(10, 15, 25, 50, 100),
-                                   selected = 15, width = "150px")
-                     )
-                   ),
-                   DTOutput("results_table")
-                 )),
-        tabPanel("Pivot Table",
-                 box(
-                   width = 12,
-                   h4("Interactive Pivot Table"),
-                   p("Drag and drop fields to create custom pivot tables and charts. This view uses the current query results."),
-                   hr(),
-                   conditionalPanel(
-                     condition = "output.has_query_results",
-                     div(
-                       class = "pivot-container",
-                       rpivotTableOutput("pivot_table")
-                     )
-                   ),
-                   conditionalPanel(
-                     condition = "!output.has_query_results",
-                     div(
-                       style = "text-align: center; padding: 30px; color: #6c757d;",
-                       icon("info-circle", style = "font-size: 48px;"),
-                       h4("No Data Available"),
-                       p("Run a SQL query first to load data for the pivot table.")
-                     )
-                   )
-                 )),
-        tabPanel("Data Visualization",
-                 box(
-                   width = 12,
-                   h4("Interactive Data Visualization"),
-                   p("Visualize your query results with interactive charts."),
-                   hr(),
-                   conditionalPanel(
-                     condition = "output.has_query_results",
-                     fluidRow(
-                       column(3,
-                              selectInput("plot_type", "Plot Type:", 
-                                          choices = c("Bar Chart" = "bar",
-                                                      "Line Chart" = "line",
-                                                      "Scatter Plot" = "scatter",
-                                                      "Box Plot" = "box",
-                                                      "Histogram" = "histogram"),
-                                          selected = "bar")
+                       style = "display: flex; justify-content: space-between; margin-bottom: 10px;",
+                       div(
+                         style = "display: flex; gap: 10px;",
+                         downloadButton("download_results", "Download Results"),
+                         actionButton("clear_btn", "Clear Results", icon = icon("eraser"), 
+                                      class = "btn-warning")
                        ),
-                       column(3,
-                              uiOutput("x_axis_ui")
-                       ),
-                       column(3,
-                              uiOutput("y_axis_ui")
-                       ),
-                       column(3,
-                              uiOutput("color_by_ui")
+                       div(
+                         selectInput("results_page_length", "Rows per page:", 
+                                     choices = c(10, 15, 25, 50, 100),
+                                     selected = 15, width = "150px")
                        )
                      ),
+                     DTOutput("results_table")
+                   )),
+          tabPanel("Pivot Table",
+                   box(
+                     width = 12,
+                     h4("Interactive Pivot Table"),
+                     p("Drag and drop fields to create custom pivot tables and charts. This view uses the current query results."),
                      hr(),
-                     plotlyOutput("data_plot", height = "600px")
-                   ),
-                   conditionalPanel(
-                     condition = "!output.has_query_results",
-                     div(
-                       style = "text-align: center; padding: 30px; color: #6c757d;",
-                       icon("info-circle", style = "font-size: 48px;"),
-                       h4("No Data Available"),
-                       p("Run a SQL query first to load data for visualization.")
+                     conditionalPanel(
+                       condition = "output.has_query_results",
+                       div(
+                         class = "pivot-container",
+                         rpivotTableOutput("pivot_table")
+                       )
+                     ),
+                     conditionalPanel(
+                       condition = "!output.has_query_results",
+                       div(
+                         style = "text-align: center; padding: 30px; color: #6c757d;",
+                         icon("info-circle", style = "font-size: 48px;"),
+                         h4("No Data Available"),
+                         p("Run a SQL query first to load data for the pivot table.")
+                       )
                      )
-                   )
-                 )),
-        tabPanel("Database Info", 
-                 box(
-                   width = 12,
-                   h4("Database Structure"),
-                   verbatimTextOutput("db_info")
-                 )),
-        tabPanel("Query History",
-                 box(
-                   width = 12,
-                   h4("Recently Executed Queries"),
-                   div(
-                     style = "margin-bottom: 10px;",
-                     actionButton("clear_history_btn", "Clear History", 
-                                  icon = icon("trash"), class = "btn-sm btn-danger"),
-                     actionButton("rerun_query_btn", "Rerun Selected Query", 
-                                  icon = icon("redo"), class = "btn-sm btn-info")
-                   ),
-                   DTOutput("query_history_table")
-                 )),
-        tabPanel("Help",
-                 box(
-                   width = 12,
-                   h4("DuckDB SQL Query Interface Help"),
-                   tags$ul(
-                     tags$li(tags$b("Connection:"), "Connect to an in-memory database or a file-based DuckDB database."),
-                     tags$li(tags$b("Database Explorer:"), "Browse schemas and tables in your connected database."),
-                     tags$li(tags$b("SQL Queries:"), "Enter SQL queries in the text area and click 'Run Query'.")
-                   ),
-                   
-                   h4("SQL Reference"),
-                   tags$ul(
-                     tags$li(tags$b("Basic Queries:"), 
-                             tags$ul(
-                               tags$li(
-                                 HTML("<code><span style='color:#D73A49;font-weight:bold;'>SELECT</span> * <span style='color:#D73A49;font-weight:bold;'>FROM</span> sqlite_master;</code>")
-                               ),
-                               tags$li(
-                                 HTML("<code><span style='color:#D73A49;font-weight:bold;'>CREATE TABLE</span> tablename (<span style='color:#6F42C1;'>col1</span> <span style='color:#005CC5;'>INT</span>, <span style='color:#6F42C1;'>col2</span> <span style='color:#005CC5;'>VARCHAR</span>);</code>")
-                               ),
-                               tags$li(
-                                 HTML("<code><span style='color:#D73A49;font-weight:bold;'>INSERT INTO</span> tablename <span style='color:#D73A49;font-weight:bold;'>VALUES</span> (1, <span style='color:#032F62;'>'value'</span>);</code>")
-                               ),
-                               tags$li(
-                                 HTML("<code><span style='color:#D73A49;font-weight:bold;'>SELECT</span> * <span style='color:#D73A49;font-weight:bold;'>FROM</span> tablename <span style='color:#D73A49;font-weight:bold;'>WHERE</span> condition;</code>")
-                               )
-                             )
+                   )),
+          tabPanel("Data Visualization",
+                   box(
+                     width = 12,
+                     h4("Interactive Data Visualization"),
+                     p("Visualize your query results with interactive charts."),
+                     hr(),
+                     conditionalPanel(
+                       condition = "output.has_query_results",
+                       fluidRow(
+                         column(3,
+                                selectInput("plot_type", "Plot Type:", 
+                                            choices = c("Bar Chart" = "bar",
+                                                        "Line Chart" = "line",
+                                                        "Scatter Plot" = "scatter",
+                                                        "Box Plot" = "box",
+                                                        "Histogram" = "histogram"),
+                                            selected = "bar")
+                         ),
+                         column(3,
+                                uiOutput("x_axis_ui")
+                         ),
+                         column(3,
+                                uiOutput("y_axis_ui")
+                         ),
+                         column(3,
+                                uiOutput("color_by_ui")
+                         )
+                       ),
+                       hr(),
+                       h4("Summary Statistics"),
+                       fluidRow(
+                         column(4,
+                                selectInput("summary_column", "Select Column for Summary:", 
+                                            choices = NULL)
+                         ),
+                         column(4,
+                                selectInput("summary_function", "Summary Function:", 
+                                            choices = c("Count" = "count",
+                                                        "Sum" = "sum",
+                                                        "Mean" = "mean",
+                                                        "Median" = "median",
+                                                        "Min" = "min",
+                                                        "Max" = "max",
+                                                        "Standard Deviation" = "sd"),
+                                            selected = "mean")
+                         ),
+                         column(4,
+                                checkboxInput("group_by_summary", "Group By", value = FALSE),
+                                conditionalPanel(
+                                  condition = "input.group_by_summary == true",
+                                  selectInput("group_by_column", "Group By Column:", choices = NULL)
+                                )
+                         )
+                       ),
+                       fluidRow(
+                         column(12,
+                                uiOutput("summary_stats"),
+                                DT::dataTableOutput("summary_table")
+                         )
+                       ),
+                       hr(),
+                       plotlyOutput("data_plot", height = "600px")
                      ),
-                     tags$li(tags$b("Working with Spaces in Names:"), 
-                             tags$ul(
-                               tags$li(
-                                 HTML("<code><span style='color:#D73A49;font-weight:bold;'>SELECT</span> * <span style='color:#D73A49;font-weight:bold;'>FROM</span> <span style='color:#032F62;'>\"My Table\"</span>;</code>")
-                               ),
-                               tags$li(
-                                 HTML("<code><span style='color:#D73A49;font-weight:bold;'>SELECT</span> <span style='color:#032F62;'>\"First Name\"</span>, <span style='color:#032F62;'>\"Last Name\"</span> <span style='color:#D73A49;font-weight:bold;'>FROM</span> customers;</code>")
-                               ),
-                               tags$li(
-                                 HTML("<code><span style='color:#D73A49;font-weight:bold;'>SELECT</span> t.<span style='color:#032F62;'>\"Product Name\"</span> <span style='color:#D73A49;font-weight:bold;'>FROM</span> <span style='color:#032F62;'>\"Product Items\"</span> t;</code>")
-                               ),
-                               tags$li(
-                                 HTML("<code><span style='color:#D73A49;font-weight:bold;'>SELECT</span> c.name, o.<span style='color:#032F62;'>\"order date\"</span> <span style='color:#D73A49;font-weight:bold;'>FROM</span> customers c <span style='color:#D73A49;font-weight:bold;'>JOIN</span> <span style='color:#032F62;'>\"Order Details\"</span> o <span style='color:#D73A49;font-weight:bold;'>ON</span> c.id = o.customer_id;</code>")
-                               )
-                             )
+                     conditionalPanel(
+                       condition = "!output.has_query_results",
+                       div(
+                         style = "text-align: center; padding: 30px; color: #6c757d;",
+                         icon("info-circle", style = "font-size: 48px;"),
+                         h4("No Data Available"),
+                         p("Run a SQL query first to load data for visualization.")
+                       )
+                     )
+                   )),
+          tabPanel("Database Info", 
+                   box(
+                     width = 12,
+                     h4("Database Structure"),
+                     verbatimTextOutput("db_info")
+                   )),
+          tabPanel("Esquisse",
+                   box(
+                     width = 12,
+                     h4("Interactive ggplot Builder"),
+                     p("Create custom visualizations using the interactive ggplot builder. This view uses the current query results."),
+                     hr(),
+                     conditionalPanel(
+                       condition = "output.has_query_results",
+                       div(
+                         class = "esquisse-container",
+                         esquisse::esquisse_ui("esquisse")
+                       )
                      ),
-                     tags$li(tags$b("Case Sensitivity:"), "DuckDB identifiers are case-insensitive by default, but become case-sensitive when quoted."),
-                     tags$li(tags$b("Special Characters:"), "Use double quotes for any identifier with spaces, special characters, or to preserve case sensitivity.")
-                   ),
-                   
-                   h4("Importing Data"),
-                   tags$ul(
-                     tags$li(tags$b("CSV Import:"), "Upload a CSV file and specify a table name to import data."),
-                     tags$li(tags$b("Parquet Import:"), "Upload a Parquet file and specify a table name to import data."),
-                     tags$li(tags$b("Excel Import:"), "Upload an Excel file (.xlsx or .xls) and specify a table name to import data. You can optionally specify a sheet name.")
-                   ),
-                   
-                   h4("SQL Editor Keyboard Shortcuts"),
-                   tags$ul(
-                     tags$li(tags$b("Run Query:"), "Ctrl+Enter"),
-                     tags$li(tags$b("Format SQL:"), "Click the 'Format SQL' button to beautify your query"),
-                     tags$li(tags$b("Auto-complete:"), "Ctrl+Space to trigger auto-completion")
-                   ),
-                   
-                   h4("Advanced Analysis Features"),
-                   tags$ul(
-                     tags$li(tags$b("Pivot Table:"), "Create interactive pivot tables and charts from your query results. Drag and drop columns to pivot, filter, and aggregate your data."),
-                     tags$li(tags$b("Data Visualization:"), "Use interactive charts to visualize your query results.")
-                   ),
-                   
-                   h4("Examples with Spaces in Names"),
-                   tags$div(
-                     class = "sql-example-container",
-                     style = "background-color: #f8f9fa; padding: 15px; border-radius: 4px; font-family: monospace; overflow-x: auto;",
-                     HTML("
+                     conditionalPanel(
+                       condition = "!output.has_query_results",
+                       div(
+                         style = "text-align: center; padding: 30px; color: #6c757d;",
+                         icon("info-circle", style = "font-size: 48px;"),
+                         h4("No Data Available"),
+                         p("Run a SQL query first to load data for the ggplot builder.")
+                       )
+                     )
+                   )),
+          tabPanel("Prophet",
+                   box(
+                     width = 12,
+                     h4("Time Series Forecasting with Prophet"),
+                     p("Forecast your time series data using Facebook's Prophet algorithm."),
+                     hr(),
+                     conditionalPanel(
+                       condition = "output.has_query_results",
+                       fluidRow(
+                         column(3,
+                                uiOutput("date_column_ui")
+                         ),
+                         column(3,
+                                uiOutput("value_column_ui")
+                         ),
+                         column(3,
+                                numericInput("forecast_periods", "Forecast Periods:", 
+                                             value = 30, min = 1, max = 365)
+                         ),
+                         column(3,
+                                checkboxInput("yearly_seasonality", "Yearly Seasonality", value = TRUE),
+                                checkboxInput("weekly_seasonality", "Weekly Seasonality", value = TRUE)
+                         )
+                       ),
+                       hr(),
+                       div(
+                         class = "text-center",
+                         actionButton("run_forecast_btn", "Run Forecast", icon = icon("chart-line"), 
+                                      class = "btn-primary"),
+                         conditionalPanel(
+                           condition = "input.run_forecast_btn > 0 && output.is_forecasting",
+                           div(
+                             style = "margin-top: 15px;",
+                             p("Generating forecast..."),
+                             div(class = "progress-striped active",
+                                 div(class = "progress-bar progress-bar-info", 
+                                     style = "width: 100%"))
+                           )
+                         )
+                       ),
+                       hr(),
+                       plotlyOutput("prophet_plot", height = "600px"),
+                       DT::dataTableOutput("forecast_table")
+                     ),
+                     conditionalPanel(
+                       condition = "!output.has_query_results",
+                       div(
+                         style = "text-align: center; padding: 30px; color: #6c757d;",
+                         icon("info-circle", style = "font-size: 48px;"),
+                         h4("No Data Available"),
+                         p("Run a SQL query with date/time and numeric columns first to use the forecasting tool.")
+                       )
+                     )
+                   )),
+          tabPanel("Query History",
+                   box(
+                     width = 12,
+                     h4("Recently Executed Queries"),
+                     div(
+                       style = "margin-bottom: 10px;",
+                       actionButton("clear_history_btn", "Clear History", 
+                                    icon = icon("trash"), class = "btn-sm btn-danger"),
+                       actionButton("rerun_query_btn", "Rerun Selected Query", 
+                                    icon = icon("redo"), class = "btn-sm btn-info")
+                     ),
+                     DTOutput("query_history_table")
+                   )),
+          tabPanel("Help",
+                   box(
+                     width = 12,
+                     h4("DuckDB SQL Query Interface Help"),
+                     tags$ul(
+                       tags$li(tags$b("Connection:"), "Connect to an in-memory database or a file-based DuckDB database."),
+                       tags$li(tags$b("Database Explorer:"), "Browse schemas and tables in your connected database."),
+                       tags$li(tags$b("SQL Queries:"), "Enter SQL queries in the text area and click 'Run Query'.")
+                     ),
+                     
+                     h4("SQL Reference"),
+                     tags$ul(
+                       tags$li(tags$b("Basic Queries:"), 
+                               tags$ul(
+                                 tags$li(
+                                   HTML("<code><span style='color:#D73A49;font-weight:bold;'>SELECT</span> * <span style='color:#D73A49;font-weight:bold;'>FROM</span> sqlite_master;</code>")
+                                 ),
+                                 tags$li(
+                                   HTML("<code><span style='color:#D73A49;font-weight:bold;'>CREATE TABLE</span> tablename (<span style='color:#6F42C1;'>col1</span> <span style='color:#005CC5;'>INT</span>, <span style='color:#6F42C1;'>col2</span> <span style='color:#005CC5;'>VARCHAR</span>);</code>")
+                                 ),
+                                 tags$li(
+                                   HTML("<code><span style='color:#D73A49;font-weight:bold;'>INSERT INTO</span> tablename <span style='color:#D73A49;font-weight:bold;'>VALUES</span> (1, <span style='color:#032F62;'>'value'</span>);</code>")
+                                 ),
+                                 tags$li(
+                                   HTML("<code><span style='color:#D73A49;font-weight:bold;'>SELECT</span> * <span style='color:#D73A49;font-weight:bold;'>FROM</span> tablename <span style='color:#D73A49;font-weight:bold;'>WHERE</span> condition;</code>")
+                                 )
+                               )
+                       ),
+                       tags$li(tags$b("Working with Spaces in Names:"), 
+                               tags$ul(
+                                 tags$li(
+                                   HTML("<code><span style='color:#D73A49;font-weight:bold;'>SELECT</span> * <span style='color:#D73A49;font-weight:bold;'>FROM</span> <span style='color:#032F62;'>\"My Table\"</span>;</code>")
+                                 ),
+                                 tags$li(
+                                   HTML("<code><span style='color:#D73A49;font-weight:bold;'>SELECT</span> <span style='color:#032F62;'>\"First Name\"</span>, <span style='color:#032F62;'>\"Last Name\"</span> <span style='color:#D73A49;font-weight:bold;'>FROM</span> customers;</code>")
+                                 ),
+                                 tags$li(
+                                   HTML("<code><span style='color:#D73A49;font-weight:bold;'>SELECT</span> t.<span style='color:#032F62;'>\"Product Name\"</span> <span style='color:#D73A49;font-weight:bold;'>FROM</span> <span style='color:#032F62;'>\"Product Items\"</span> t;</code>")
+                                 ),
+                                 tags$li(
+                                   HTML("<code><span style='color:#D73A49;font-weight:bold;'>SELECT</span> c.name, o.<span style='color:#032F62;'>\"order date\"</span> <span style='color:#D73A49;font-weight:bold;'>FROM</span> customers c <span style='color:#D73A49;font-weight:bold;'>JOIN</span> <span style='color:#032F62;'>\"Order Details\"</span> o <span style='color:#D73A49;font-weight:bold;'>ON</span> c.id = o.customer_id;</code>")
+                                 )
+                               )
+                       ),
+                       tags$li(tags$b("Case Sensitivity:"), "DuckDB identifiers are case-insensitive by default, but become case-sensitive when quoted."),
+                       tags$li(tags$b("Special Characters:"), "Use double quotes for any identifier with spaces, special characters, or to preserve case sensitivity.")
+                     ),
+                     
+                     h4("Importing Data"),
+                     tags$ul(
+                       tags$li(tags$b("CSV Import:"), "Upload a CSV file and specify a table name to import data."),
+                       tags$li(tags$b("Parquet Import:"), "Upload a Parquet file and specify a table name to import data."),
+                       tags$li(tags$b("Excel Import:"), "Upload an Excel file (.xlsx or .xls) and specify a table name to import data. You can optionally specify a sheet name.")
+                     ),
+                     
+                     h4("SQL Editor Keyboard Shortcuts"),
+                     tags$ul(
+                       tags$li(tags$b("Run Query:"), "Ctrl+Enter"),
+                       tags$li(tags$b("Format SQL:"), "Click the 'Format SQL' button to beautify your query"),
+                       tags$li(tags$b("Auto-complete:"), "Ctrl+Space to trigger auto-completion")
+                     ),
+                     
+                     h4("Advanced Analysis Features"),
+                     tags$ul(
+                       tags$li(tags$b("Pivot Table:"), "Create interactive pivot tables and charts from your query results. Drag and drop columns to pivot, filter, and aggregate your data."),
+                       tags$li(tags$b("Data Visualization:"), "Use interactive charts to visualize your query results. Choose from various chart types and apply filtering and grouping."),
+                       tags$li(tags$b("Summary Statistics:"), "Calculate statistical measures like sum, count, median, mean, and standard deviation for numeric data columns."),
+                       tags$li(tags$b("Esquisse:"), "Build custom ggplot2 visualizations using an intuitive drag-and-drop interface. Perfect for creating publication-quality graphics."),
+                       tags$li(tags$b("Prophet:"), "Perform time series forecasting on your data using Facebook's Prophet algorithm. Predict future values based on historical patterns.")
+                     ),
+                     
+                     h4("Examples with Spaces in Names"),
+                     tags$div(
+                       class = "sql-example-container",
+                       style = "background-color: #f8f9fa; padding: 15px; border-radius: 4px; font-family: monospace; overflow-x: auto;",
+                       HTML("
                        <div><span style='color:#6A737D;'>-- Select from a table with spaces in its name</span></div>
                        <div><span style='color:#D73A49;font-weight:bold;'>SELECT</span> * <span style='color:#D73A49;font-weight:bold;'>FROM</span> <span style='color:#032F62;'>\"My Table\"</span>;</div>
                        <br>
@@ -398,10 +563,9 @@ ui <- fluidPage(
                        <div><span style='color:#D73A49;font-weight:bold;'>JOIN</span> <span style='color:#032F62;'>\"Products\"</span> p <span style='color:#D73A49;font-weight:bold;'>ON</span> o.<span style='color:#032F62;'>\"Product ID\"</span> = p.<span style='color:#032F62;'>\"Product ID\"</span></div>
                        <div><span style='color:#D73A49;font-weight:bold;'>ORDER BY</span> o.<span style='color:#032F62;'>\"Order Date\"</span>;</div>
                      ")
-                   )
-                 ))
-      ),
-      width = 9
+                     )
+                   ))
+        )
     )
   )
 )
@@ -417,6 +581,12 @@ server <- function(input, output, session) {
     return(!is.null(values$query_result) && nrow(values$query_result) > 0)
   })
   outputOptions(output, "has_query_results", suspendWhenHidden = FALSE)
+  
+  # Define a reactive value to track if forecasting is in progress
+  output$is_forecasting <- reactive({
+    return(values$forecasting)
+  })
+  outputOptions(output, "is_forecasting", suspendWhenHidden = FALSE)
   
   # Add SQL formatting function
   formatSQL <- function(sql_query) {
@@ -512,7 +682,10 @@ server <- function(input, output, session) {
     ),
     recent_connections = character(),
     tables_list = list(),
-    selected_table = NULL
+    selected_table = NULL,
+    prophet_plot_data = NULL,
+    prophet_forecast_table = NULL,
+    forecasting = FALSE
   )
   
   # Load recent connections from a settings file (if exists)
@@ -1313,6 +1486,120 @@ server <- function(input, output, session) {
     return(p)
   })
   
+  # Update column choices for summary statistics
+  observe({
+    req(values$query_result)
+    
+    # Get column names
+    col_names <- colnames(values$query_result)
+    
+    # Detect numeric columns for summary functions
+    numeric_cols <- sapply(values$query_result, is.numeric)
+    numeric_col_names <- col_names[numeric_cols]
+    
+    # Update UI elements
+    updateSelectInput(session, "summary_column", 
+                      choices = numeric_col_names,
+                      selected = if(length(numeric_col_names) > 0) numeric_col_names[1] else NULL)
+    
+    updateSelectInput(session, "group_by_column", 
+                      choices = col_names,
+                      selected = if(length(col_names) > 0) col_names[1] else NULL)
+  })
+  
+  # Calculate and render summary statistics
+  output$summary_stats <- renderUI({
+    req(values$query_result, input$summary_column, input$summary_function)
+    
+    # Check if the selected column exists and is numeric
+    if(!input$summary_column %in% colnames(values$query_result) || 
+       !is.numeric(values$query_result[[input$summary_column]])) {
+      return(div(
+        class = "summary-stats",
+        "Please select a numeric column for summary statistics."
+      ))
+    }
+    
+    # Calculate summary statistic
+    if(input$group_by_summary && !is.null(input$group_by_column)) {
+      # No calculation here, handled by the summary table
+      return(NULL)
+    } else {
+      # Simple summary without grouping
+      col_data <- values$query_result[[input$summary_column]]
+      
+      result <- switch(input$summary_function,
+                       "count" = length(col_data),
+                       "sum" = sum(col_data, na.rm = TRUE),
+                       "mean" = mean(col_data, na.rm = TRUE),
+                       "median" = median(col_data, na.rm = TRUE),
+                       "min" = min(col_data, na.rm = TRUE),
+                       "max" = max(col_data, na.rm = TRUE),
+                       "sd" = sd(col_data, na.rm = TRUE),
+                       NA)
+      
+      # Format the result
+      formatted_result <- if(input$summary_function %in% c("mean", "sd")) {
+        round(result, 4)
+      } else {
+        result
+      }
+      
+      # Create a nice UI for the result
+      div(
+        class = "summary-stats",
+        div(class = "summary-value", formatted_result),
+        div(class = "summary-label", 
+            paste(toupper(substr(input$summary_function, 1, 1)), 
+                  substr(input$summary_function, 2, nchar(input$summary_function)), 
+                  "of", input$summary_column))
+      )
+    }
+  })
+  
+  # Render summary table for grouped statistics
+  output$summary_table <- renderDT({
+    req(values$query_result, input$summary_column, input$summary_function)
+    
+    # Check if grouping is enabled
+    if(!input$group_by_summary || is.null(input$group_by_column)) {
+      return(NULL)
+    }
+    
+    # Check if the selected column exists and is numeric
+    if(!input$summary_column %in% colnames(values$query_result) || 
+       !is.numeric(values$query_result[[input$summary_column]])) {
+      return(NULL)
+    }
+    
+    # Create a grouped summary using dplyr
+    summary_data <- values$query_result %>%
+      group_by_at(input$group_by_column) %>%
+      summarize_at(vars(input$summary_column), 
+                   list(Value = function(x) {
+                     switch(input$summary_function,
+                            "count" = length(x),
+                            "sum" = sum(x, na.rm = TRUE),
+                            "mean" = mean(x, na.rm = TRUE),
+                            "median" = median(x, na.rm = TRUE),
+                            "min" = min(x, na.rm = TRUE),
+                            "max" = max(x, na.rm = TRUE),
+                            "sd" = sd(x, na.rm = TRUE),
+                            NA)
+                   })) %>%
+      as.data.frame()
+    
+    # Return a datatable
+    datatable(summary_data,
+              options = list(
+                pageLength = 10,
+                dom = 'Bfrtip',
+                buttons = c('copy', 'csv', 'excel')
+              ),
+              rownames = FALSE) %>%
+      formatRound(columns = "Value", digits = 4)
+  })
+  
   # Download handler for results
   output$download_results <- downloadHandler(
     filename = function() {
@@ -1345,6 +1632,246 @@ server <- function(input, output, session) {
         dbDisconnect(values$conn, shutdown = TRUE)
       }
     })
+  })
+  
+  # Esquisse module for interactive ggplot
+  observe({
+    req(values$query_result)
+    # Call esquisse module with current query results
+    esquisse::esquisse_server(
+      id = "esquisse",
+      data = reactive({values$query_result})
+    )
+  })
+  
+  # Prophet forecasting - UI elements
+  output$date_column_ui <- renderUI({
+    req(values$query_result)
+    
+    # Detect date/datetime columns
+    col_names <- colnames(values$query_result)
+    date_cols <- sapply(values$query_result, function(x) {
+      inherits(x, "Date") || inherits(x, "POSIXct") || inherits(x, "POSIXlt") ||
+        (is.character(x) && all(grepl("^\\d{4}-\\d{2}-\\d{2}", na.omit(x))))
+    })
+    date_col_names <- col_names[date_cols]
+    
+    # If no date columns found, allow selecting character columns that might contain dates
+    if(length(date_col_names) == 0) {
+      char_cols <- sapply(values$query_result, is.character)
+      date_col_names <- col_names[char_cols]
+    }
+    
+    selectInput("date_column", "Date Column:", 
+                choices = date_col_names,
+                selected = if(length(date_col_names) > 0) date_col_names[1] else NULL)
+  })
+  
+  output$value_column_ui <- renderUI({
+    req(values$query_result)
+    
+    # Detect numeric columns
+    col_names <- colnames(values$query_result)
+    numeric_cols <- sapply(values$query_result, is.numeric)
+    numeric_col_names <- col_names[numeric_cols]
+    
+    selectInput("value_column", "Value Column:", 
+                choices = numeric_col_names,
+                selected = if(length(numeric_col_names) > 0) numeric_col_names[1] else NULL)
+  })
+  
+  # Prophet forecasting - Generate forecast
+  observeEvent(input$run_forecast_btn, {
+    req(values$query_result, input$date_column, input$value_column)
+    
+    # Show status message that forecasting is in progress
+    values$status <- "Generating forecast... please wait."
+    values$forecasting <- TRUE
+    
+    # Check that required columns exist
+    if(!input$date_column %in% colnames(values$query_result) || 
+       !input$value_column %in% colnames(values$query_result)) {
+      values$status <- "Error: Selected columns not found in data."
+      values$forecasting <- FALSE
+      return(NULL)
+    }
+    
+    # Check that value column is numeric
+    if(!is.numeric(values$query_result[[input$value_column]])) {
+      values$status <- "Error: Value column must be numeric for forecasting."
+      values$forecasting <- FALSE
+      return(NULL)
+    }
+    
+    # Prepare data for Prophet
+    tryCatch({
+      # Create data frame with required 'ds' and 'y' columns
+      prophet_data <- data.frame(
+        ds = values$query_result[[input$date_column]],
+        y = values$query_result[[input$value_column]]
+      )
+      
+      # Convert ds to Date if it's not already
+      if(!inherits(prophet_data$ds, "Date")) {
+        tryCatch({
+          prophet_data$ds <- as.Date(prophet_data$ds, format = "%Y-%m-%d")
+        }, error = function(e) {
+          # Try alternative formats if the default fails
+          tryCatch({
+            prophet_data$ds <- as.Date(prophet_data$ds, format = "%m/%d/%Y")
+          }, error = function(e) {
+            tryCatch({
+              prophet_data$ds <- as.Date(prophet_data$ds, format = "%d-%m-%Y")
+            }, error = function(e) {
+              # Final attempt with lubridate
+              if(requireNamespace("lubridate", quietly = TRUE)) {
+                prophet_data$ds <- lubridate::parse_date_time(prophet_data$ds, orders = c("ymd", "mdy", "dmy"))
+              }
+            })
+          })
+        })
+      }
+      
+      # Check if conversion was successful
+      if(any(is.na(prophet_data$ds))) {
+        values$status <- "Error: Could not convert date column to Date format. Try a different column."
+        values$forecasting <- FALSE
+        return(NULL)
+      }
+      
+      # Remove rows with NA values
+      prophet_data <- na.omit(prophet_data)
+      
+      # Check if we have enough data
+      if(nrow(prophet_data) < 2) {
+        values$status <- "Error: Not enough valid data points for forecasting."
+        values$forecasting <- FALSE
+        return(NULL)
+      }
+      
+      # Create and fit Prophet model
+      m <- prophet::prophet(
+        prophet_data,
+        yearly.seasonality = input$yearly_seasonality,
+        weekly.seasonality = input$weekly_seasonality
+      )
+      
+      # Create future dataframe for prediction
+      future <- prophet::make_future_dataframe(m, periods = input$forecast_periods)
+      
+      # Make prediction
+      forecast <- prophet::predict(m, future)
+      
+      # Ensure we have proper data structure for plotting
+      if(nrow(forecast) <= nrow(prophet_data)) {
+        values$status <- "Error: Forecast couldn't be generated beyond input data."
+        values$forecasting <- FALSE
+        return(NULL)
+      }
+      
+      # Prepare data for plots - create a data frame suitable for plotly
+      actual_data <- data.frame(
+        date = prophet_data$ds,
+        value = prophet_data$y,
+        type = "Actual"
+      )
+      
+      forecast_data <- data.frame(
+        date = forecast$ds[(nrow(prophet_data) + 1):nrow(forecast)],
+        value = forecast$yhat[(nrow(prophet_data) + 1):nrow(forecast)],
+        type = "Forecast"
+      )
+      
+      plot_data <- rbind(actual_data, forecast_data)
+      
+      # Create forecast table for display
+      forecast_table <- forecast %>%
+        dplyr::select(ds, yhat, yhat_lower, yhat_upper) %>%
+        dplyr::filter(ds >= max(prophet_data$ds)) %>%
+        dplyr::rename(
+          Date = ds,
+          Forecast = yhat,
+          Lower_Bound = yhat_lower,
+          Upper_Bound = yhat_upper
+        )
+      
+      # Store results in reactive values
+      values$prophet_plot_data <- plot_data
+      values$prophet_forecast_table <- forecast_table
+      
+      values$status <- "Forecast generated successfully."
+      values$forecasting <- FALSE
+      
+    }, error = function(e) {
+      print(paste("Prophet forecasting error:", e$message))
+      values$status <- paste0("Error in forecasting: ", e$message)
+      values$forecasting <- FALSE
+    })
+  })
+  
+  # Render Prophet plot
+  output$prophet_plot <- renderPlotly({
+    req(values$prophet_plot_data)
+    
+    # Make sure we have data in the correct format
+    if(!"date" %in% colnames(values$prophet_plot_data) || 
+       !"value" %in% colnames(values$prophet_plot_data) ||
+       !"type" %in% colnames(values$prophet_plot_data)) {
+      return(plotly_empty(type = "scatter", mode = "markers") %>% 
+               layout(title = "Error: Invalid forecast data format"))
+    }
+    
+    # Split data by type for separate traces
+    actual_data <- values$prophet_plot_data[values$prophet_plot_data$type == "Actual",]
+    forecast_data <- values$prophet_plot_data[values$prophet_plot_data$type == "Forecast",]
+    
+    if(nrow(actual_data) == 0 || nrow(forecast_data) == 0) {
+      return(plotly_empty(type = "scatter", mode = "markers") %>% 
+               layout(title = "Error: Missing actual or forecast data"))
+    }
+    
+    # Create plot with separate traces
+    p <- plot_ly() %>%
+      add_trace(
+        data = actual_data,
+        x = ~date, 
+        y = ~value,
+        type = "scatter",
+        mode = "markers+lines",
+        name = "Actual",
+        marker = list(color = "blue")
+      ) %>%
+      add_trace(
+        data = forecast_data,
+        x = ~date, 
+        y = ~value,
+        type = "scatter",
+        mode = "lines",
+        name = "Forecast",
+        line = list(color = "red")
+      ) %>%
+      layout(
+        title = "Time Series Forecast",
+        xaxis = list(title = "Date"),
+        yaxis = list(title = input$value_column),
+        showlegend = TRUE
+      )
+    
+    return(p)
+  })
+  
+  # Render forecast table
+  output$forecast_table <- renderDT({
+    req(values$prophet_forecast_table)
+    
+    datatable(values$prophet_forecast_table,
+              options = list(
+                pageLength = 10,
+                dom = 'Bfrtip',
+                buttons = c('copy', 'csv', 'excel')
+              ),
+              rownames = FALSE) %>%
+      formatRound(columns = c("Forecast", "Lower_Bound", "Upper_Bound"), digits = 2)
   })
 }
 
