@@ -10,6 +10,14 @@ library(shinyjs)
 library(shinyWidgets)
 library(shinydashboard)
 library(shinyFiles)
+library(shinyAce)  # Add shinyAce for SQL syntax highlighting
+library(rpivotTable) # Add rpivotTable for pivot tables
+library(plotly)  # For data visualization instead of radiant
+library(tibble)
+library(readr)
+library(readxl)
+library(arrow)
+library(magrittr)  # For the pipe operator
 
 # UI Definition
 ui <- fluidPage(
@@ -29,6 +37,15 @@ ui <- fluidPage(
       .table-item { cursor: pointer; padding: 5px; margin: 2px 0; border-radius: 3px; }
       .table-item:hover { background-color: #f5f5f5; }
       .schema-item { font-weight: bold; margin-top: 8px; }
+      .ace_editor { border: 1px solid #ddd; border-radius: 4px; }
+      .ace_keyword { color: #D73A49 !important; font-weight: bold; }
+      .ace_function { color: #6F42C1 !important; }
+      .ace_string { color: #032F62 !important; }
+      .ace_numeric { color: #005CC5 !important; }
+      .ace_operator { color: #D73A49 !important; }
+      .ace_comment { color: #6A737D !important; font-style: italic; }
+      .radiant-container { width: 100%; height: 800px; }
+      .pivot-container { padding: 20px; }
     "))
   ),
   titlePanel(div(
@@ -100,14 +117,34 @@ ui <- fluidPage(
         solidHeader = TRUE,
         collapsible = TRUE,
         
-        textAreaInput("sql_query", NULL, height = "200px", 
-                      value = "SELECT * FROM sqlite_master;"),
-        checkboxInput("explain_query", "Explain Query Plan", value = FALSE),
+        aceEditor(
+          outputId = "sql_query",
+          value = "SELECT * FROM sqlite_master;",
+          mode = "sql",
+          theme = "sqlserver",
+          height = "200px",
+          fontSize = 14,
+          autoComplete = "enabled",
+          highlightActiveLine = TRUE,
+          showLineNumbers = TRUE,
+          hotkeys = list(runKey = list(win = "Ctrl-Enter", mac = "Cmd-Enter")),
+          wordWrap = TRUE
+        ),
+        
         div(
-          style = "display: flex; justify-content: space-between;",
-          actionButton("run_query_btn", "Run Query", icon = icon("play"), 
-                       class = "btn-primary"),
-          actionButton("clear_btn", "Clear Results", icon = icon("eraser"))
+          style = "display: flex; justify-content: space-between; align-items: center; margin-top: 10px;",
+          div(
+            style = "display: flex; align-items: center;",
+            checkboxInput("explain_query", "Explain Query Plan", value = FALSE),
+            span(style = "margin-left: 15px; color: #6c757d; font-size: 0.9em;", "Press Ctrl+Enter to run")
+          ),
+          div(
+            style = "display: flex; justify-content: flex-end;",
+            actionButton("format_query_btn", "Format SQL", icon = icon("indent"), 
+                         class = "btn-sm btn-info", style = "margin-right: 10px;"),
+            actionButton("run_query_btn", "Run Query", icon = icon("play"), 
+                         class = "btn-primary")
+          )
         )
       ),
       
@@ -178,7 +215,12 @@ ui <- fluidPage(
                    hr(),
                    div(
                      style = "display: flex; justify-content: space-between; margin-bottom: 10px;",
-                     downloadButton("download_results", "Download Results"),
+                     div(
+                       style = "display: flex; gap: 10px;",
+                       downloadButton("download_results", "Download Results"),
+                       actionButton("clear_btn", "Clear Results", icon = icon("eraser"), 
+                                    class = "btn-warning")
+                     ),
                      div(
                        selectInput("results_page_length", "Rows per page:", 
                                    choices = c(10, 15, 25, 50, 100),
@@ -186,6 +228,70 @@ ui <- fluidPage(
                      )
                    ),
                    DTOutput("results_table")
+                 )),
+        tabPanel("Pivot Table",
+                 box(
+                   width = 12,
+                   h4("Interactive Pivot Table"),
+                   p("Drag and drop fields to create custom pivot tables and charts. This view uses the current query results."),
+                   hr(),
+                   conditionalPanel(
+                     condition = "output.has_query_results",
+                     div(
+                       class = "pivot-container",
+                       rpivotTableOutput("pivot_table")
+                     )
+                   ),
+                   conditionalPanel(
+                     condition = "!output.has_query_results",
+                     div(
+                       style = "text-align: center; padding: 30px; color: #6c757d;",
+                       icon("info-circle", style = "font-size: 48px;"),
+                       h4("No Data Available"),
+                       p("Run a SQL query first to load data for the pivot table.")
+                     )
+                   )
+                 )),
+        tabPanel("Data Visualization",
+                 box(
+                   width = 12,
+                   h4("Interactive Data Visualization"),
+                   p("Visualize your query results with interactive charts."),
+                   hr(),
+                   conditionalPanel(
+                     condition = "output.has_query_results",
+                     fluidRow(
+                       column(3,
+                              selectInput("plot_type", "Plot Type:", 
+                                          choices = c("Bar Chart" = "bar",
+                                                      "Line Chart" = "line",
+                                                      "Scatter Plot" = "scatter",
+                                                      "Box Plot" = "box",
+                                                      "Histogram" = "histogram"),
+                                          selected = "bar")
+                       ),
+                       column(3,
+                              uiOutput("x_axis_ui")
+                       ),
+                       column(3,
+                              uiOutput("y_axis_ui")
+                       ),
+                       column(3,
+                              uiOutput("color_by_ui")
+                       )
+                     ),
+                     hr(),
+                     plotlyOutput("data_plot", height = "600px")
+                   ),
+                   conditionalPanel(
+                     condition = "!output.has_query_results",
+                     div(
+                       style = "text-align: center; padding: 30px; color: #6c757d;",
+                       icon("info-circle", style = "font-size: 48px;"),
+                       h4("No Data Available"),
+                       p("Run a SQL query first to load data for visualization.")
+                     )
+                   )
                  )),
         tabPanel("Database Info", 
                  box(
@@ -220,18 +326,34 @@ ui <- fluidPage(
                    tags$ul(
                      tags$li(tags$b("Basic Queries:"), 
                              tags$ul(
-                               tags$li("List all tables: SELECT * FROM sqlite_master;"),
-                               tags$li("Create a table: CREATE TABLE tablename (col1 INT, col2 VARCHAR);"),
-                               tags$li("Insert data: INSERT INTO tablename VALUES (1, 'value');"),
-                               tags$li("Query data: SELECT * FROM tablename WHERE condition;")
+                               tags$li(
+                                 HTML("<code><span style='color:#D73A49;font-weight:bold;'>SELECT</span> * <span style='color:#D73A49;font-weight:bold;'>FROM</span> sqlite_master;</code>")
+                               ),
+                               tags$li(
+                                 HTML("<code><span style='color:#D73A49;font-weight:bold;'>CREATE TABLE</span> tablename (<span style='color:#6F42C1;'>col1</span> <span style='color:#005CC5;'>INT</span>, <span style='color:#6F42C1;'>col2</span> <span style='color:#005CC5;'>VARCHAR</span>);</code>")
+                               ),
+                               tags$li(
+                                 HTML("<code><span style='color:#D73A49;font-weight:bold;'>INSERT INTO</span> tablename <span style='color:#D73A49;font-weight:bold;'>VALUES</span> (1, <span style='color:#032F62;'>'value'</span>);</code>")
+                               ),
+                               tags$li(
+                                 HTML("<code><span style='color:#D73A49;font-weight:bold;'>SELECT</span> * <span style='color:#D73A49;font-weight:bold;'>FROM</span> tablename <span style='color:#D73A49;font-weight:bold;'>WHERE</span> condition;</code>")
+                               )
                              )
                      ),
                      tags$li(tags$b("Working with Spaces in Names:"), 
                              tags$ul(
-                               tags$li("Tables with spaces: SELECT * FROM \"My Table\";"),
-                               tags$li("Columns with spaces: SELECT \"First Name\", \"Last Name\" FROM customers;"),
-                               tags$li("Table aliases: SELECT t.\"Product Name\" FROM \"Product Items\" t;"),
-                               tags$li("Joins with spaces: SELECT c.name, o.\"order date\" FROM customers c JOIN \"Order Details\" o ON c.id = o.customer_id;")
+                               tags$li(
+                                 HTML("<code><span style='color:#D73A49;font-weight:bold;'>SELECT</span> * <span style='color:#D73A49;font-weight:bold;'>FROM</span> <span style='color:#032F62;'>\"My Table\"</span>;</code>")
+                               ),
+                               tags$li(
+                                 HTML("<code><span style='color:#D73A49;font-weight:bold;'>SELECT</span> <span style='color:#032F62;'>\"First Name\"</span>, <span style='color:#032F62;'>\"Last Name\"</span> <span style='color:#D73A49;font-weight:bold;'>FROM</span> customers;</code>")
+                               ),
+                               tags$li(
+                                 HTML("<code><span style='color:#D73A49;font-weight:bold;'>SELECT</span> t.<span style='color:#032F62;'>\"Product Name\"</span> <span style='color:#D73A49;font-weight:bold;'>FROM</span> <span style='color:#032F62;'>\"Product Items\"</span> t;</code>")
+                               ),
+                               tags$li(
+                                 HTML("<code><span style='color:#D73A49;font-weight:bold;'>SELECT</span> c.name, o.<span style='color:#032F62;'>\"order date\"</span> <span style='color:#D73A49;font-weight:bold;'>FROM</span> customers c <span style='color:#D73A49;font-weight:bold;'>JOIN</span> <span style='color:#032F62;'>\"Order Details\"</span> o <span style='color:#D73A49;font-weight:bold;'>ON</span> c.id = o.customer_id;</code>")
+                               )
                              )
                      ),
                      tags$li(tags$b("Case Sensitivity:"), "DuckDB identifiers are case-insensitive by default, but become case-sensitive when quoted."),
@@ -245,9 +367,37 @@ ui <- fluidPage(
                      tags$li(tags$b("Excel Import:"), "Upload an Excel file (.xlsx or .xls) and specify a table name to import data. You can optionally specify a sheet name.")
                    ),
                    
+                   h4("SQL Editor Keyboard Shortcuts"),
+                   tags$ul(
+                     tags$li(tags$b("Run Query:"), "Ctrl+Enter"),
+                     tags$li(tags$b("Format SQL:"), "Click the 'Format SQL' button to beautify your query"),
+                     tags$li(tags$b("Auto-complete:"), "Ctrl+Space to trigger auto-completion")
+                   ),
+                   
+                   h4("Advanced Analysis Features"),
+                   tags$ul(
+                     tags$li(tags$b("Pivot Table:"), "Create interactive pivot tables and charts from your query results. Drag and drop columns to pivot, filter, and aggregate your data."),
+                     tags$li(tags$b("Data Visualization:"), "Use interactive charts to visualize your query results.")
+                   ),
+                   
                    h4("Examples with Spaces in Names"),
-                   tags$pre(
-                     HTML("-- Select from a table with spaces in its name\nSELECT * FROM \"My Table\";\n\n-- Select columns with spaces\nSELECT \"First Name\", \"Last Name\" FROM \"Customer Data\";\n\n-- Join tables with spaces in names and columns\nSELECT c.\"First Name\", o.\"Order Date\", p.\"Product Name\"\nFROM \"Customers\" c\nJOIN \"Orders\" o ON c.\"Customer ID\" = o.\"Customer ID\"\nJOIN \"Products\" p ON o.\"Product ID\" = p.\"Product ID\"\nORDER BY o.\"Order Date\";")
+                   tags$div(
+                     class = "sql-example-container",
+                     style = "background-color: #f8f9fa; padding: 15px; border-radius: 4px; font-family: monospace; overflow-x: auto;",
+                     HTML("
+                       <div><span style='color:#6A737D;'>-- Select from a table with spaces in its name</span></div>
+                       <div><span style='color:#D73A49;font-weight:bold;'>SELECT</span> * <span style='color:#D73A49;font-weight:bold;'>FROM</span> <span style='color:#032F62;'>\"My Table\"</span>;</div>
+                       <br>
+                       <div><span style='color:#6A737D;'>-- Select columns with spaces</span></div>
+                       <div><span style='color:#D73A49;font-weight:bold;'>SELECT</span> <span style='color:#032F62;'>\"First Name\"</span>, <span style='color:#032F62;'>\"Last Name\"</span> <span style='color:#D73A49;font-weight:bold;'>FROM</span> <span style='color:#032F62;'>\"Customer Data\"</span>;</div>
+                       <br>
+                       <div><span style='color:#6A737D;'>-- Join tables with spaces in names and columns</span></div>
+                       <div><span style='color:#D73A49;font-weight:bold;'>SELECT</span> c.<span style='color:#032F62;'>\"First Name\"</span>, o.<span style='color:#032F62;'>\"Order Date\"</span>, p.<span style='color:#032F62;'>\"Product Name\"</span></div>
+                       <div><span style='color:#D73A49;font-weight:bold;'>FROM</span> <span style='color:#032F62;'>\"Customers\"</span> c</div>
+                       <div><span style='color:#D73A49;font-weight:bold;'>JOIN</span> <span style='color:#032F62;'>\"Orders\"</span> o <span style='color:#D73A49;font-weight:bold;'>ON</span> c.<span style='color:#032F62;'>\"Customer ID\"</span> = o.<span style='color:#032F62;'>\"Customer ID\"</span></div>
+                       <div><span style='color:#D73A49;font-weight:bold;'>JOIN</span> <span style='color:#032F62;'>\"Products\"</span> p <span style='color:#D73A49;font-weight:bold;'>ON</span> o.<span style='color:#032F62;'>\"Product ID\"</span> = p.<span style='color:#032F62;'>\"Product ID\"</span></div>
+                       <div><span style='color:#D73A49;font-weight:bold;'>ORDER BY</span> o.<span style='color:#032F62;'>\"Order Date\"</span>;</div>
+                     ")
                    )
                  ))
       ),
@@ -261,6 +411,86 @@ server <- function(input, output, session) {
   # Set up shinyFiles
   volumes <- c(Home = fs::path_home(), getVolumes()())
   shinyFileChoose(input, "file_select", roots = volumes, filetypes = c("duckdb", "db"))
+  
+  # Define a reactive value to track if query results are available
+  output$has_query_results <- reactive({
+    return(!is.null(values$query_result) && nrow(values$query_result) > 0)
+  })
+  outputOptions(output, "has_query_results", suspendWhenHidden = FALSE)
+  
+  # Add SQL formatting function
+  formatSQL <- function(sql_query) {
+    # Basic SQL formatting (this is a simple version)
+    # Replace this with a more robust SQL formatter if needed
+    
+    # Convert SQL keywords to uppercase
+    keywords <- c(
+      # Standard SQL keywords
+      "SELECT", "FROM", "WHERE", "JOIN", "LEFT", "RIGHT", "INNER", "OUTER", 
+      "GROUP BY", "ORDER BY", "HAVING", "LIMIT", "OFFSET", "UNION", "ALL", 
+      "INSERT", "INTO", "VALUES", "UPDATE", "SET", "DELETE", "CREATE", "TABLE",
+      "ALTER", "DROP", "INDEX", "VIEW", "AND", "OR", "NOT", "NULL", "IS", "IN",
+      "BETWEEN", "LIKE", "ASC", "DESC", "DISTINCT", "AS", "WITH", "CASE", "WHEN",
+      "THEN", "ELSE", "END", "ON", "USING", "EXISTS",
+      
+      # DuckDB specific keywords
+      "PRAGMA", "COPY", "DESCRIBE", "EXPLAIN", "EXPORT", "IMPORT", "INSTALL", 
+      "LOAD", "ATTACH", "DETACH", "PREPARE", "EXECUTE", "VACUUM", "CHECKPOINT",
+      "READ_CSV", "READ_CSV_AUTO", "READ_PARQUET", "READ_JSON", "READ_JSON_AUTO",
+      "BOOL", "BOOLEAN", "TINYINT", "SMALLINT", "INTEGER", "INT", "BIGINT", "HUGEINT",
+      "REAL", "FLOAT", "DOUBLE", "DECIMAL", "VARCHAR", "CHAR", "TEXT", "DATE", "TIME",
+      "TIMESTAMP", "BLOB", "PARTITION", "CAST", "TRY_CAST", "OVER"
+    )
+    
+    formatted_sql <- sql_query
+    
+    # Add newlines after common clause keywords
+    clause_keywords <- c("SELECT", "FROM", "WHERE", "GROUP BY", "ORDER BY", "HAVING", "LIMIT")
+    for (keyword in clause_keywords) {
+      pattern <- paste0("(?i)\\b", keyword, "\\b")
+      replacement <- paste0("\n", toupper(keyword), " ")
+      formatted_sql <- gsub(pattern, replacement, formatted_sql, perl = TRUE)
+    }
+    
+    # Add newlines and indentation for joins
+    join_keywords <- c("LEFT JOIN", "RIGHT JOIN", "INNER JOIN", "OUTER JOIN", "JOIN")
+    for (keyword in join_keywords) {
+      pattern <- paste0("(?i)\\b", keyword, "\\b")
+      replacement <- paste0("\n  ", toupper(keyword), " ")
+      formatted_sql <- gsub(pattern, replacement, formatted_sql, perl = TRUE)
+    }
+    
+    # Convert all other keywords to uppercase
+    for (keyword in keywords) {
+      pattern <- paste0("(?i)\\b", keyword, "\\b")
+      replacement <- toupper(keyword)
+      formatted_sql <- gsub(pattern, replacement, formatted_sql, perl = TRUE)
+    }
+    
+    # Convert comma followed by a non-space to comma space
+    formatted_sql <- gsub(",([^ ])", ", \\1", formatted_sql)
+    
+    # Remove multiple consecutive spaces
+    formatted_sql <- gsub("[ ]+", " ", formatted_sql)
+    
+    # Remove trailing whitespace
+    formatted_sql <- gsub("[ \t]+\n", "\n", formatted_sql)
+    
+    # Ensure there's no leading whitespace
+    formatted_sql <- gsub("^\n+", "", formatted_sql)
+    
+    return(formatted_sql)
+  }
+  
+  # Format SQL button handler
+  observeEvent(input$format_query_btn, {
+    if (trimws(input$sql_query) != "") {
+      # Format the SQL query
+      formatted_sql <- formatSQL(input$sql_query)
+      # Update the ace editor with formatted SQL
+      updateAceEditor(session, "sql_query", value = formatted_sql)
+    }
+  })
   
   # Helper function to properly quote identifiers with spaces
   quoteIdentifier <- function(identifier) {
@@ -484,15 +714,18 @@ server <- function(input, output, session) {
       schema <- input$selected_table$schema
       table <- input$selected_table$table
       
-      # Generate a SELECT query for the table using the helper function
+      # Generate a SELECT query for the table using the helper function with SQL keywords in uppercase
       if (schema == "main") {
         query <- paste0("SELECT * FROM ", quoteIdentifier(table), " LIMIT 100;")
       } else {
         query <- paste0("SELECT * FROM ", quoteIdentifier(schema), ".", quoteIdentifier(table), " LIMIT 100;")
       }
       
+      # Format the SQL for better display
+      formatted_query <- formatSQL(query)
+      
       # Update the query input
-      updateTextAreaInput(session, "sql_query", value = query)
+      updateAceEditor(session, "sql_query", value = formatted_query)
     }
   })
   
@@ -531,8 +764,22 @@ server <- function(input, output, session) {
           values$status <- paste0("Query executed successfully. Returned ", 
                                   nrow(values$query_result), " rows in ", 
                                   duration, " seconds.")
+          
+          # Make the analysis tabs available when results are returned
+          shinyjs::removeClass(selector = ".nav-tabs a[data-value='Pivot Table']", class = "disabled")
+          shinyjs::removeClass(selector = ".nav-tabs a[data-value='Data Visualization']", class = "disabled")
+          
+          # Force reactivity update for tabs
+          output$has_query_results <- reactive({
+            return(TRUE)
+          })
         } else {
           values$status <- "Query executed successfully. No rows returned."
+          
+          # Force reactivity update for tabs
+          output$has_query_results <- reactive({
+            return(FALSE)
+          })
         }
       } else {
         # For non-SELECT queries (INSERT, UPDATE, CREATE, etc.)
@@ -545,6 +792,11 @@ server <- function(input, output, session) {
         values$status <- paste0("Query executed successfully. Affected ", 
                                 result, " rows in ", duration, " seconds.")
         values$query_result <- NULL
+        
+        # Force reactivity update for tabs
+        output$has_query_results <- reactive({
+          return(FALSE)
+        })
         
         # Refresh database explorer after DDL statements
         if (grepl("^\\s*(CREATE|DROP|ALTER)", toupper(query))) {
@@ -575,12 +827,6 @@ server <- function(input, output, session) {
         stringsAsFactors = FALSE
       ), values$query_history)
     })
-  })
-  
-  # Clear results
-  observeEvent(input$clear_btn, {
-    values$query_result <- NULL
-    values$status <- "Results cleared."
   })
   
   # List tables
@@ -881,8 +1127,8 @@ server <- function(input, output, session) {
         updateTabsetPanel(session, "main_tabs", selected = "Database Info")
         
         # Generate a query to show the data and put it in the SQL query box
-        updateTextAreaInput(session, "sql_query", 
-                            value = paste0("SELECT * FROM ", quoted_table_name, " LIMIT 100;"))
+        formatted_query <- formatSQL(paste0("SELECT * FROM ", quoted_table_name, " LIMIT 100;"))
+        updateAceEditor(session, "sql_query", value = formatted_query)
       } else {
         values$status <- paste0("Error: Table '", table_name, "' was not created. Check the file format.")
       }
@@ -890,6 +1136,17 @@ server <- function(input, output, session) {
     }, error = function(e) {
       values$status <- paste0("Error importing file: ", e$message)
       print(paste("Import error:", e$message))
+    })
+  })
+  
+  # Clear results
+  observeEvent(input$clear_btn, {
+    values$query_result <- NULL
+    values$status <- "Results cleared."
+    
+    # Force reactivity update for tabs
+    output$has_query_results <- reactive({
+      return(FALSE)
     })
   })
   
@@ -913,7 +1170,7 @@ server <- function(input, output, session) {
   observeEvent(input$rerun_query_btn, {
     if (!is.null(values$selected_history_row) && length(values$selected_history_row) > 0) {
       selected_query <- values$query_history$Query[values$selected_history_row]
-      updateTextAreaInput(session, "sql_query", value = selected_query)
+      updateAceEditor(session, "sql_query", value = selected_query)
     } else {
       values$status <- "Please select a query from the history first."
     }
@@ -964,6 +1221,98 @@ server <- function(input, output, session) {
     }
   })
   
+  # Render pivot table
+  output$pivot_table <- renderRpivotTable({
+    req(values$query_result)
+    
+    rpivotTable(
+      data = values$query_result,
+      rows = colnames(values$query_result)[1],  # Default to first column for rows
+      cols = if(ncol(values$query_result) > 1) colnames(values$query_result)[2] else NULL,  # Default to second column for cols if available
+      aggregatorName = "Count",
+      rendererName = "Table",
+      width = "100%",
+      height = "600px"
+    )
+  })
+  
+  # Dynamic UI for visualization
+  output$x_axis_ui <- renderUI({
+    req(values$query_result)
+    selectInput("x_axis", "X-Axis:", 
+                choices = colnames(values$query_result),
+                selected = colnames(values$query_result)[1])
+  })
+  
+  output$y_axis_ui <- renderUI({
+    req(values$query_result)
+    selectInput("y_axis", "Y-Axis:", 
+                choices = colnames(values$query_result),
+                selected = if(ncol(values$query_result) > 1) colnames(values$query_result)[2] else colnames(values$query_result)[1])
+  })
+  
+  output$color_by_ui <- renderUI({
+    req(values$query_result)
+    selectInput("color_by", "Color By:", 
+                choices = c("None" = "none", colnames(values$query_result)),
+                selected = "none")
+  })
+  
+  # Update the data visualization plots
+  output$data_plot <- renderPlotly({
+    req(values$query_result, input$plot_type, input$x_axis, input$y_axis)
+    
+    plot_data <- values$query_result
+    plot_type <- input$plot_type
+    
+    # Basic plot parameters
+    p <- plot_ly(plot_data)
+    
+    # Apply color if selected
+    if (!is.null(input$color_by) && input$color_by != "none") {
+      color_var <- input$color_by
+      
+      if (plot_type == "bar") {
+        p <- plot_ly(plot_data, x = ~get(input$x_axis), y = ~get(input$y_axis), 
+                     color = ~get(color_var), type = "bar")
+      } else if (plot_type == "line") {
+        p <- plot_ly(plot_data, x = ~get(input$x_axis), y = ~get(input$y_axis), 
+                     color = ~get(color_var), type = "scatter", mode = "lines")
+      } else if (plot_type == "scatter") {
+        p <- plot_ly(plot_data, x = ~get(input$x_axis), y = ~get(input$y_axis), 
+                     color = ~get(color_var), type = "scatter", mode = "markers")
+      } else if (plot_type == "box") {
+        p <- plot_ly(plot_data, y = ~get(input$y_axis), color = ~get(color_var), type = "box")
+      } else if (plot_type == "histogram") {
+        p <- plot_ly(plot_data, x = ~get(input$x_axis), color = ~get(color_var), type = "histogram")
+      }
+    } else {
+      if (plot_type == "bar") {
+        p <- plot_ly(plot_data, x = ~get(input$x_axis), y = ~get(input$y_axis), type = "bar")
+      } else if (plot_type == "line") {
+        p <- plot_ly(plot_data, x = ~get(input$x_axis), y = ~get(input$y_axis), 
+                     type = "scatter", mode = "lines")
+      } else if (plot_type == "scatter") {
+        p <- plot_ly(plot_data, x = ~get(input$x_axis), y = ~get(input$y_axis), 
+                     type = "scatter", mode = "markers")
+      } else if (plot_type == "box") {
+        p <- plot_ly(plot_data, y = ~get(input$y_axis), type = "box")
+      } else if (plot_type == "histogram") {
+        p <- plot_ly(plot_data, x = ~get(input$x_axis), type = "histogram")
+      }
+    }
+    
+    # Add layout with responsive sizing
+    p <- p %>% layout(
+      title = paste("Plot of", input$y_axis, "vs", input$x_axis),
+      xaxis = list(title = input$x_axis),
+      yaxis = list(title = input$y_axis),
+      autosize = TRUE
+    )
+    
+    return(p)
+  })
+  
   # Download handler for results
   output$download_results <- downloadHandler(
     filename = function() {
@@ -991,9 +1340,11 @@ server <- function(input, output, session) {
   
   # Clean up on session end
   session$onSessionEnded(function() {
-    if (!is.null(values$conn)) {
-      dbDisconnect(values$conn, shutdown = TRUE)
-    }
+    isolate({
+      if (!is.null(values$conn)) {
+        dbDisconnect(values$conn, shutdown = TRUE)
+      }
+    })
   })
 }
 
