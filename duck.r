@@ -1,6 +1,25 @@
 # DuckDB SQL Query Interface
 # A Shiny application for executing SQL queries on DuckDB databases
 
+# Ensure required packages are installed
+if (!require("prophet")) {
+  message("Installing prophet package...")
+  install.packages("prophet", dependencies = TRUE)
+  library(prophet)
+  
+  # Verify installation
+  if (!require("prophet")) {
+    stop("Failed to install prophet. Please install it manually with: install.packages('prophet', dependencies = TRUE)")
+  }
+}
+
+# Define a direct prediction function for prophet models
+# This ensures we can always predict even if the export is missing
+prophet_prediction <- function(model, future_df) {
+  # This directly calls the predict method without relying on exports
+  return(predict(model, future_df))
+}
+
 library(shiny)
 library(DBI)
 library(duckdb)
@@ -19,9 +38,10 @@ library(readxl)
 library(arrow)
 library(magrittr)  # For the pipe operator
 library(esquisse)  # For interactive ggplot visualization
-library(prophet)   # For time series forecasting
 library(dplyr)     # For data manipulation
 library(lubridate) # For date/time handling
+library(Rcpp)      # Required for prophet to work correctly
+library(prophet)   # For time series forecasting
 
 # UI Definition
 ui <- fluidPage(
@@ -55,501 +75,636 @@ ui <- fluidPage(
       .summary-value { font-size: 24px; font-weight: bold; color: #2c3e50; }
       .summary-label { font-size: 14px; color: #7b8a8b; }
       
-      /* Sidebar toggle button styles */
-      #sidebar-toggle-container {
-        position: fixed;
-        top: 60px;
-        left: 5px;
-        z-index: 1000;
+      /* Full-width content */
+      .content-container {
+        padding: 15px;
       }
-      .btn-sidebar-toggle {
-        border-radius: 50%;
-        width: 40px;
-        height: 40px;
-        padding: 0;
-        line-height: 40px;
-        text-align: center;
-        font-size: 16px;
+      
+      /* Header styling */
+      .app-header {
         background-color: #2c3e50;
         color: white;
-        box-shadow: 0 2px 5px rgba(0,0,0,0.3);
+        padding: 15px;
+        margin-bottom: 20px;
+        border-radius: 5px;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.1);
       }
-      .btn-sidebar-toggle:hover {
-        background-color: #1a252f;
-        color: white;
+      
+      /* Status bar */
+      .status-bar {
+        background-color: #f8f9fa;
+        padding: 10px 15px;
+        border-radius: 5px;
+        margin-bottom: 15px;
+        border-left: 4px solid #2c3e50;
+      }
+      
+      /* Tab styling */
+      .nav-tabs > li > a {
+        background-color: #f8f9fa;
+        color: #2c3e50;
+        border-radius: 4px 4px 0 0;
+      }
+      .nav-tabs > li.active > a, 
+      .nav-tabs > li.active > a:hover, 
+      .nav-tabs > li.active > a:focus {
+        background-color: #ffffff;
+        color: #2c3e50;
+        font-weight: bold;
       }
     "))
   ),
-  titlePanel(div(
-    icon("database"), 
-    "DuckDB SQL Query Interface", 
-    style = "color: #2c3e50; font-weight: bold;"
-  )),
   
-  tags$div(id = "sidebar-toggle-container",
-           actionButton("toggle_sidebar", "", 
-                        icon = icon("bars"), 
-                        class = "btn-sidebar-toggle",
-                        title = "Toggle Sidebar")
+  # App Header
+  div(class = "app-header",
+      div(class = "container-fluid",
+          div(class = "row",
+              div(class = "col-md-10",
+                  h2(icon("database"), "DuckDB SQL Query Interface")
+              ),
+              div(class = "col-md-2 text-right",
+                  br(),
+                  actionButton("connect_btn", "Connect", icon = icon("plug"), 
+                               class = "btn-success"),
+                  actionButton("disconnect_btn", "Disconnect", icon = icon("unlink"), 
+                               class = "btn-danger")
+              )
+          )
+      )
   ),
   
-  tags$script(HTML("
-    $(document).ready(function() {
-      $('#toggle_sidebar').on('click', function() {
-        $('#left-column').toggle('fast');
-        var mainWidth = $('#right-column').hasClass('col-sm-9') ? 12 : 9;
-        $('#right-column').toggleClass('col-sm-12 col-sm-9');
-        
-        // Change the icon based on sidebar state
-        var icon = $('#left-column').is(':visible') ? 'fa-bars' : 'fa-chevron-right';
-        $('#toggle_sidebar i').removeClass('fa-bars fa-chevron-right').addClass(icon);
-      });
-    });
-  ")),
+  # Status Bar
+  div(class = "status-bar", textOutput("connection_status")),
   
-  fluidRow(
-    div(id = "left-column", class = "col-sm-3",
-        # Database connection section
-        box(
-          width = 12,
-          title = "Database Connection", 
-          status = "primary", 
-          solidHeader = TRUE,
-          collapsible = TRUE,
-          
-          radioButtons("conn_type", "Connection Type:", 
-                       choices = c("In-Memory" = "memory", 
-                                   "File-based" = "file"),
-                       selected = "memory"),
-          conditionalPanel(
-            condition = "input.conn_type == 'file'",
-            div(
-              style = "display: flex; justify-content: space-between; align-items: center;",
-              textInput("db_path", "Database Path:", value = "my_database.duckdb", width = "80%"),
-              shinyFilesButton("file_select", "Browse", "Select DuckDB file", 
-                               multiple = FALSE, class = "btn-sm btn-info")
-            ),
-            checkboxInput("create_db", "Create if it doesn't exist", value = TRUE),
-            conditionalPanel(
-              condition = "output.has_recent_connections == 'true'",
-              h5("Recent Connections:"),
-              uiOutput("recent_connections")
-            )
-          ),
-          div(
-            style = "display: flex; justify-content: space-between;",
-            actionButton("connect_btn", "Connect", icon = icon("plug"), 
-                         class = "btn-success"),
-            actionButton("disconnect_btn", "Disconnect", icon = icon("unlink"), 
-                         class = "btn-danger")
-          ),
-          textOutput("connection_status")
+  # Main Content
+  div(class = "content-container",
+      tabsetPanel(
+        id = "main_tabs",
+        
+        # Query Tab (replaces sidebar)
+        tabPanel("Query Editor", 
+                 # Top section with database tools and connection options
+                 fluidRow(
+                   # Database connection section
+                   column(4,
+                          box(
+                            width = 12,
+                            title = "Database Connection", 
+                            status = "primary", 
+                            solidHeader = TRUE,
+                            collapsible = TRUE,
+                            
+                            radioButtons("conn_type", "Connection Type:", 
+                                         choices = c("In-Memory" = "memory", 
+                                                     "File-based" = "file"),
+                                         selected = "memory"),
+                            conditionalPanel(
+                              condition = "input.conn_type == 'file'",
+                              div(
+                                style = "display: flex; justify-content: space-between; align-items: center;",
+                                textInput("db_path", "Database Path:", value = "my_database.duckdb", width = "80%"),
+                                shinyFilesButton("file_select", "Browse", "Select DuckDB file", 
+                                                 multiple = FALSE, class = "btn-sm btn-info")
+                              ),
+                              checkboxInput("create_db", "Create if it doesn't exist", value = TRUE),
+                              conditionalPanel(
+                                condition = "output.has_recent_connections == 'true'",
+                                h5("Recent Connections:"),
+                                uiOutput("recent_connections")
+                              )
+                            )
+                          )
+                   ),
+                   
+                   # Database explorer section
+                   column(4,
+                          box(
+                            width = 12,
+                            title = "Database Explorer", 
+                            status = "info", 
+                            solidHeader = TRUE,
+                            collapsible = TRUE,
+                            div(id = "database_explorer", 
+                                uiOutput("db_structure_ui")),
+                            div(
+                              style = "margin-top: 10px;",
+                              actionButton("refresh_explorer_btn", "Refresh", icon = icon("sync"), 
+                                           class = "btn-sm btn-info")
+                            )
+                          )
+                   ),
+                   
+                   # Database tools section
+                   column(4,
+                          box(
+                            width = 12,
+                            title = "Database Tools", 
+                            status = "primary", 
+                            solidHeader = TRUE,
+                            collapsible = TRUE,
+                            
+                            div(
+                              style = "display: flex; justify-content: space-between; margin-bottom: 10px;",
+                              actionButton("list_tables_btn", "List Tables", icon = icon("list"), 
+                                           class = "btn-sm btn-info"),
+                              actionButton("show_schemas_btn", "Show Schemas", icon = icon("sitemap"), 
+                                           class = "btn-sm btn-info")
+                            ),
+                            hr(),
+                            # Data import
+                            selectInput("import_file_type", "File Type:",
+                                        choices = c("CSV" = "csv", 
+                                                    "Parquet" = "parquet", 
+                                                    "Excel" = "excel"),
+                                        selected = "csv"),
+                            
+                            # Import options
+                            conditionalPanel(
+                              condition = "input.import_file_type == 'csv'",
+                              fileInput("csv_file", "Import CSV File", 
+                                        accept = c("text/csv", "text/comma-separated-values", ".csv")),
+                              checkboxInput("csv_header", "First Row is Header", value = TRUE),
+                              textInput("csv_delimiter", "Delimiter:", value = ",")
+                            ),
+                            
+                            conditionalPanel(
+                              condition = "input.import_file_type == 'parquet'",
+                              fileInput("parquet_file", "Import Parquet File", 
+                                        accept = c(".parquet"))
+                            ),
+                            
+                            conditionalPanel(
+                              condition = "input.import_file_type == 'excel'",
+                              fileInput("excel_file", "Import Excel File", 
+                                        accept = c(".xlsx", ".xls")),
+                              checkboxInput("excel_header", "First Row is Header", value = TRUE),
+                              textInput("excel_sheet", "Sheet Name (optional):", value = "")
+                            ),
+                            
+                            textInput("table_name", "Import As Table:", value = "imported_data"),
+                            
+                            div(
+                              style = "display: flex; justify-content: center;",
+                              actionButton("import_btn", "Import Data", icon = icon("file-import"), 
+                                           class = "btn-sm btn-primary")
+                            )
+                          )
+                   )
+                 ),
+                 
+                 # SQL Query editor section
+                 fluidRow(
+                   column(12,
+                          box(
+                            width = 12,
+                            title = "SQL Query", 
+                            status = "primary", 
+                            solidHeader = TRUE,
+                            
+                            aceEditor(
+                              outputId = "sql_query",
+                              value = "SELECT * FROM sqlite_master;",
+                              mode = "sql",
+                              theme = "sqlserver",
+                              height = "250px",
+                              fontSize = 14,
+                              autoComplete = "enabled",
+                              highlightActiveLine = TRUE,
+                              showLineNumbers = TRUE,
+                              hotkeys = list(runKey = list(win = "Ctrl-Enter", mac = "Cmd-Enter")),
+                              wordWrap = TRUE
+                            ),
+                            
+                            div(
+                              style = "display: flex; justify-content: space-between; align-items: center; margin-top: 10px;",
+                              div(
+                                style = "display: flex; align-items: center;",
+                                checkboxInput("explain_query", "Explain Query Plan", value = FALSE),
+                                span(style = "margin-left: 15px; color: #6c757d; font-size: 0.9em;", "Press Ctrl+Enter to run")
+                              ),
+                              div(
+                                style = "display: flex; justify-content: flex-end;",
+                                actionButton("format_query_btn", "Format SQL", icon = icon("indent"), 
+                                             class = "btn-sm btn-info", style = "margin-right: 10px;"),
+                                actionButton("run_query_btn", "Run Query", icon = icon("play"), 
+                                             class = "btn-primary")
+                              )
+                            )
+                          )
+                   )
+                 ),
+                 
+                 # Query results section
+                 fluidRow(
+                   column(12,
+                          box(
+                            width = 12,
+                            title = "Query Results", 
+                            status = "info", 
+                            solidHeader = TRUE,
+                            
+                            # Query status and controls
+                            verbatimTextOutput("query_status"),
+                            hr(),
+                            div(
+                              style = "display: flex; justify-content: space-between; margin-bottom: 10px;",
+                              div(
+                                style = "display: flex; gap: 10px;",
+                                downloadButton("download_results", "Download Results"),
+                                actionButton("clear_btn", "Clear Results", icon = icon("eraser"), 
+                                             class = "btn-warning")
+                              ),
+                              div(
+                                selectInput("results_page_length", "Rows per page:", 
+                                            choices = c(10, 15, 25, 50, 100),
+                                            selected = 15, width = "150px")
+                              )
+                            ),
+                            
+                            # Results table
+                            DTOutput("results_table")
+                          )
+                   )
+                 )
         ),
         
-        # Database explorer section
-        box(
-          width = 12,
-          title = "Database Explorer", 
-          status = "info", 
-          solidHeader = TRUE,
-          collapsible = TRUE,
-          div(id = "database_explorer", 
-              uiOutput("db_structure_ui")),
-          div(
-            style = "margin-top: 10px;",
-            actionButton("refresh_explorer_btn", "Refresh", icon = icon("sync"), 
-                         class = "btn-sm btn-info")
-          )
-        ),
+        # Pivot Table Tab
+        tabPanel("Pivot Table",
+                 box(
+                   width = 12,
+                   h4("Interactive Pivot Table"),
+                   p("Drag and drop fields to create custom pivot tables and charts. This view uses the current query results."),
+                   hr(),
+                   conditionalPanel(
+                     condition = "output.has_query_results",
+                     div(
+                       class = "pivot-container",
+                       rpivotTableOutput("pivot_table")
+                     )
+                   ),
+                   conditionalPanel(
+                     condition = "!output.has_query_results",
+                     div(
+                       style = "text-align: center; padding: 30px; color: #6c757d;",
+                       icon("info-circle", style = "font-size: 48px;"),
+                       h4("No Data Available"),
+                       p("Run a SQL query first to load data for the pivot table.")
+                     )
+                   )
+                 )),
         
-        # Query input section
-        box(
-          width = 12,
-          title = "SQL Query", 
-          status = "primary", 
-          solidHeader = TRUE,
-          collapsible = TRUE,
-          
-          aceEditor(
-            outputId = "sql_query",
-            value = "SELECT * FROM sqlite_master;",
-            mode = "sql",
-            theme = "sqlserver",
-            height = "200px",
-            fontSize = 14,
-            autoComplete = "enabled",
-            highlightActiveLine = TRUE,
-            showLineNumbers = TRUE,
-            hotkeys = list(runKey = list(win = "Ctrl-Enter", mac = "Cmd-Enter")),
-            wordWrap = TRUE
-          ),
-          
-          div(
-            style = "display: flex; justify-content: space-between; align-items: center; margin-top: 10px;",
-            div(
-              style = "display: flex; align-items: center;",
-              checkboxInput("explain_query", "Explain Query Plan", value = FALSE),
-              span(style = "margin-left: 15px; color: #6c757d; font-size: 0.9em;", "Press Ctrl+Enter to run")
-            ),
-            div(
-              style = "display: flex; justify-content: flex-end;",
-              actionButton("format_query_btn", "Format SQL", icon = icon("indent"), 
-                           class = "btn-sm btn-info", style = "margin-right: 10px;"),
-              actionButton("run_query_btn", "Run Query", icon = icon("play"), 
-                           class = "btn-primary")
-            )
-          )
-        ),
+        # Data Visualization Tab
+        tabPanel("Data Visualization",
+                 box(
+                   width = 12,
+                   h4("Interactive Data Visualization"),
+                   p("Visualize your query results with interactive charts."),
+                   hr(),
+                   conditionalPanel(
+                     condition = "output.has_query_results",
+                     fluidRow(
+                       column(3,
+                              selectInput("plot_type", "Plot Type:", 
+                                          choices = c("Bar Chart" = "bar",
+                                                      "Line Chart" = "line",
+                                                      "Scatter Plot" = "scatter",
+                                                      "Box Plot" = "box",
+                                                      "Histogram" = "histogram"),
+                                          selected = "bar")
+                       ),
+                       column(3,
+                              uiOutput("x_axis_ui")
+                       ),
+                       column(3,
+                              uiOutput("y_axis_ui")
+                       ),
+                       column(3,
+                              uiOutput("color_by_ui")
+                       )
+                     ),
+                     hr(),
+                     h4("Summary Statistics"),
+                     fluidRow(
+                       column(4,
+                              selectInput("summary_column", "Select Column for Summary:", 
+                                          choices = NULL)
+                       ),
+                       column(4,
+                              selectInput("summary_function", "Summary Function:", 
+                                          choices = c("Count" = "count",
+                                                      "Sum" = "sum",
+                                                      "Mean" = "mean",
+                                                      "Median" = "median",
+                                                      "Min" = "min",
+                                                      "Max" = "max",
+                                                      "Standard Deviation" = "sd"),
+                                          selected = "mean")
+                       ),
+                       column(4,
+                              checkboxInput("group_by_summary", "Group By", value = FALSE),
+                              conditionalPanel(
+                                condition = "input.group_by_summary == true",
+                                selectInput("group_by_column", "Group By Column:", choices = NULL)
+                              )
+                       )
+                     ),
+                     fluidRow(
+                       column(12,
+                              uiOutput("summary_stats"),
+                              DT::dataTableOutput("summary_table")
+                       )
+                     ),
+                     hr(),
+                     plotlyOutput("data_plot", height = "600px")
+                   ),
+                   conditionalPanel(
+                     condition = "!output.has_query_results",
+                     div(
+                       style = "text-align: center; padding: 30px; color: #6c757d;",
+                       icon("info-circle", style = "font-size: 48px;"),
+                       h4("No Data Available"),
+                       p("Run a SQL query first to load data for visualization.")
+                     )
+                   )
+                 )),
         
-        # Database tools section
-        box(
-          width = 12,
-          title = "Database Tools", 
-          status = "primary", 
-          solidHeader = TRUE,
-          collapsible = TRUE,
-          
-          div(
-            style = "display: flex; justify-content: space-between; margin-bottom: 10px;",
-            actionButton("list_tables_btn", "List Tables", icon = icon("list"), 
-                         class = "btn-sm btn-info"),
-            actionButton("show_schemas_btn", "Show Schemas", icon = icon("sitemap"), 
-                         class = "btn-sm btn-info")
-          ),
-          hr(),
-          # Data import
-          selectInput("import_file_type", "File Type:",
-                      choices = c("CSV" = "csv", 
-                                  "Parquet" = "parquet", 
-                                  "Excel" = "excel"),
-                      selected = "csv"),
-          
-          # Import options
-          conditionalPanel(
-            condition = "input.import_file_type == 'csv'",
-            fileInput("csv_file", "Import CSV File", 
-                      accept = c("text/csv", "text/comma-separated-values", ".csv")),
-            checkboxInput("csv_header", "First Row is Header", value = TRUE),
-            textInput("csv_delimiter", "Delimiter:", value = ",")
-          ),
-          
-          conditionalPanel(
-            condition = "input.import_file_type == 'parquet'",
-            fileInput("parquet_file", "Import Parquet File", 
-                      accept = c(".parquet"))
-          ),
-          
-          conditionalPanel(
-            condition = "input.import_file_type == 'excel'",
-            fileInput("excel_file", "Import Excel File", 
-                      accept = c(".xlsx", ".xls")),
-            checkboxInput("excel_header", "First Row is Header", value = TRUE),
-            textInput("excel_sheet", "Sheet Name (optional):", value = "")
-          ),
-          
-          textInput("table_name", "Import As Table:", value = "imported_data"),
-          
-          div(
-            style = "display: flex; justify-content: center;",
-            actionButton("import_btn", "Import Data", icon = icon("file-import"), 
-                         class = "btn-sm btn-primary")
-          )
-        ),
-        width = 3
-    ),
-    
-    div(id = "right-column", class = "col-sm-9",
-        tabsetPanel(
-          id = "main_tabs",
-          tabPanel("Results", 
-                   box(
-                     width = 12,
-                     verbatimTextOutput("query_status"),
+        # Database Info Tab
+        tabPanel("Database Info", 
+                 box(
+                   width = 12,
+                   h4("Database Structure"),
+                   verbatimTextOutput("db_info")
+                 )),
+        
+        # Esquisse Tab
+        tabPanel("Esquisse",
+                 box(
+                   width = 12,
+                   h4("Interactive ggplot Builder"),
+                   p("Create custom visualizations using the interactive ggplot builder. This view uses the current query results."),
+                   hr(),
+                   conditionalPanel(
+                     condition = "output.has_query_results",
+                     div(
+                       class = "esquisse-container",
+                       esquisse::esquisse_ui("esquisse")
+                     )
+                   ),
+                   conditionalPanel(
+                     condition = "!output.has_query_results",
+                     div(
+                       style = "text-align: center; padding: 30px; color: #6c757d;",
+                       icon("info-circle", style = "font-size: 48px;"),
+                       h4("No Data Available"),
+                       p("Run a SQL query first to load data for the ggplot builder.")
+                     )
+                   )
+                 )),
+        
+        # Prophet Tab
+        tabPanel("Prophet",
+                 box(
+                   width = 12,
+                   h4("Time Series Forecasting with Prophet"),
+                   p("Forecast your time series data using Facebook's Prophet algorithm."),
+                   hr(),
+                   conditionalPanel(
+                     condition = "output.has_query_results",
+                     fluidRow(
+                       column(3,
+                              uiOutput("date_column_ui")
+                       ),
+                       column(3,
+                              uiOutput("value_column_ui")
+                       ),
+                       column(3,
+                              numericInput("forecast_periods", "Forecast Periods:", 
+                                           value = 30, min = 1, max = 365)
+                       ),
+                       column(3,
+                              checkboxInput("yearly_seasonality", "Yearly Seasonality", value = TRUE),
+                              checkboxInput("weekly_seasonality", "Weekly Seasonality", value = TRUE)
+                       )
+                     ),
+                     hr(),
+                     
+                     # Advanced Forecasting Options (collapsible box)
+                     fluidRow(
+                       column(12,
+                              box(
+                                width = 12,
+                                title = "Advanced Options",
+                                status = "info", 
+                                solidHeader = TRUE,
+                                collapsible = TRUE,
+                                collapsed = TRUE,
+                                
+                                fluidRow(
+                                  column(4,
+                                         sliderInput("changepoint_prior_scale", "Changepoint Prior Scale:",
+                                                     min = 0.001, max = 0.5, value = 0.05, step = 0.001,
+                                                     ticks = FALSE)
+                                  ),
+                                  column(4,
+                                         sliderInput("seasonality_prior_scale", "Seasonality Prior Scale:",
+                                                     min = 0.01, max = 10, value = 10, step = 0.01,
+                                                     ticks = FALSE)
+                                  ),
+                                  column(4,
+                                         sliderInput("changepoint_range", "Changepoint Range:",
+                                                     min = 0.1, max = 0.95, value = 0.8, step = 0.05,
+                                                     ticks = FALSE)
+                                  )
+                                ),
+                                fluidRow(
+                                  column(4,
+                                         numericInput("n_changepoints", "Number of Changepoints:", 
+                                                      value = 25, min = 0, max = 100, step = 1)
+                                  ),
+                                  column(4,
+                                         checkboxInput("data_preprocessing", "Pre-process Data", value = TRUE),
+                                         conditionalPanel(
+                                           condition = "input.data_preprocessing == true",
+                                           checkboxInput("remove_outliers", "Remove Outliers", value = FALSE)
+                                         )
+                                  ),
+                                  column(4,
+                                         selectInput("growth", "Growth Model:", 
+                                                     choices = c("Linear" = "linear", 
+                                                                 "Logistic" = "logistic"),
+                                                     selected = "linear"),
+                                         conditionalPanel(
+                                           condition = "input.growth == 'logistic'",
+                                           numericInput("cap", "Capacity Cap:", 
+                                                        value = 1, min = 0)
+                                         )
+                                  )
+                                ),
+                                fluidRow(
+                                  column(6,
+                                         selectInput("seasonality_mode", "Seasonality Mode:", 
+                                                     choices = c("Additive" = "additive", 
+                                                                 "Multiplicative" = "multiplicative"),
+                                                     selected = "additive")
+                                  ),
+                                  column(6,
+                                         checkboxInput("daily_seasonality", "Daily Seasonality", value = FALSE),
+                                         conditionalPanel(
+                                           condition = "input.daily_seasonality == true",
+                                           numericInput("daily_seasonality_fourier", "Daily Fourier Terms:", 
+                                                        value = 10, min = 1, max = 20)
+                                         )
+                                  )
+                                ),
+                                p(style = "font-size: 0.9em; color: #6c757d; margin-top: 10px;",
+                                  "Adjust these parameters to improve forecast accuracy. Higher changepoint_prior_scale makes trend more flexible. Higher seasonality_prior_scale makes seasonality more flexible.")
+                              )
+                       )
+                     ),
                      hr(),
                      div(
-                       style = "display: flex; justify-content: space-between; margin-bottom: 10px;",
-                       div(
-                         style = "display: flex; gap: 10px;",
-                         downloadButton("download_results", "Download Results"),
-                         actionButton("clear_btn", "Clear Results", icon = icon("eraser"), 
-                                      class = "btn-warning")
-                       ),
-                       div(
-                         selectInput("results_page_length", "Rows per page:", 
-                                     choices = c(10, 15, 25, 50, 100),
-                                     selected = 15, width = "150px")
+                       class = "text-center",
+                       actionButton("run_forecast_btn", "Run Forecast", icon = icon("chart-line"), 
+                                    class = "btn-primary"),
+                       conditionalPanel(
+                         condition = "input.run_forecast_btn > 0 && output.is_forecasting",
+                         div(
+                           style = "margin-top: 15px;",
+                           p("Generating forecast..."),
+                           div(class = "progress-striped active",
+                               div(class = "progress-bar progress-bar-info", 
+                                   style = "width: 100%"))
+                         )
                        )
                      ),
-                     DTOutput("results_table")
-                   )),
-          tabPanel("Pivot Table",
-                   box(
-                     width = 12,
-                     h4("Interactive Pivot Table"),
-                     p("Drag and drop fields to create custom pivot tables and charts. This view uses the current query results."),
                      hr(),
-                     conditionalPanel(
-                       condition = "output.has_query_results",
-                       div(
-                         class = "pivot-container",
-                         rpivotTableOutput("pivot_table")
+                     plotlyOutput("prophet_plot", height = "600px"),
+                     
+                     # Add model metrics display
+                     fluidRow(
+                       column(12,
+                              uiOutput("forecast_metrics"),
+                              hr()
                        )
                      ),
-                     conditionalPanel(
-                       condition = "!output.has_query_results",
-                       div(
-                         style = "text-align: center; padding: 30px; color: #6c757d;",
-                         icon("info-circle", style = "font-size: 48px;"),
-                         h4("No Data Available"),
-                         p("Run a SQL query first to load data for the pivot table.")
-                       )
-                     )
-                   )),
-          tabPanel("Data Visualization",
-                   box(
-                     width = 12,
-                     h4("Interactive Data Visualization"),
-                     p("Visualize your query results with interactive charts."),
-                     hr(),
-                     conditionalPanel(
-                       condition = "output.has_query_results",
-                       fluidRow(
-                         column(3,
-                                selectInput("plot_type", "Plot Type:", 
-                                            choices = c("Bar Chart" = "bar",
-                                                        "Line Chart" = "line",
-                                                        "Scatter Plot" = "scatter",
-                                                        "Box Plot" = "box",
-                                                        "Histogram" = "histogram"),
-                                            selected = "bar")
-                         ),
-                         column(3,
-                                uiOutput("x_axis_ui")
-                         ),
-                         column(3,
-                                uiOutput("y_axis_ui")
-                         ),
-                         column(3,
-                                uiOutput("color_by_ui")
-                         )
-                       ),
-                       hr(),
-                       h4("Summary Statistics"),
-                       fluidRow(
-                         column(4,
-                                selectInput("summary_column", "Select Column for Summary:", 
-                                            choices = NULL)
-                         ),
-                         column(4,
-                                selectInput("summary_function", "Summary Function:", 
-                                            choices = c("Count" = "count",
-                                                        "Sum" = "sum",
-                                                        "Mean" = "mean",
-                                                        "Median" = "median",
-                                                        "Min" = "min",
-                                                        "Max" = "max",
-                                                        "Standard Deviation" = "sd"),
-                                            selected = "mean")
-                         ),
-                         column(4,
-                                checkboxInput("group_by_summary", "Group By", value = FALSE),
-                                conditionalPanel(
-                                  condition = "input.group_by_summary == true",
-                                  selectInput("group_by_column", "Group By Column:", choices = NULL)
-                                )
-                         )
-                       ),
-                       fluidRow(
-                         column(12,
-                                uiOutput("summary_stats"),
-                                DT::dataTableOutput("summary_table")
-                         )
-                       ),
-                       hr(),
-                       plotlyOutput("data_plot", height = "600px")
-                     ),
-                     conditionalPanel(
-                       condition = "!output.has_query_results",
-                       div(
-                         style = "text-align: center; padding: 30px; color: #6c757d;",
-                         icon("info-circle", style = "font-size: 48px;"),
-                         h4("No Data Available"),
-                         p("Run a SQL query first to load data for visualization.")
-                       )
-                     )
-                   )),
-          tabPanel("Database Info", 
-                   box(
-                     width = 12,
-                     h4("Database Structure"),
-                     verbatimTextOutput("db_info")
-                   )),
-          tabPanel("Esquisse",
-                   box(
-                     width = 12,
-                     h4("Interactive ggplot Builder"),
-                     p("Create custom visualizations using the interactive ggplot builder. This view uses the current query results."),
-                     hr(),
-                     conditionalPanel(
-                       condition = "output.has_query_results",
-                       div(
-                         class = "esquisse-container",
-                         esquisse::esquisse_ui("esquisse")
+                     
+                     # Component plots when available
+                     fluidRow(
+                       column(12,
+                              conditionalPanel(
+                                condition = "input.show_components && output.has_query_results",
+                                h4("Forecast Components"),
+                                plotlyOutput("prophet_components", height = "400px")
+                              ),
+                              checkboxInput("show_components", "Show Forecast Components", value = FALSE)
                        )
                      ),
-                     conditionalPanel(
-                       condition = "!output.has_query_results",
-                       div(
-                         style = "text-align: center; padding: 30px; color: #6c757d;",
-                         icon("info-circle", style = "font-size: 48px;"),
-                         h4("No Data Available"),
-                         p("Run a SQL query first to load data for the ggplot builder.")
-                       )
-                     )
-                   )),
-          tabPanel("Prophet",
-                   box(
-                     width = 12,
-                     h4("Time Series Forecasting with Prophet"),
-                     p("Forecast your time series data using Facebook's Prophet algorithm."),
-                     hr(),
-                     conditionalPanel(
-                       condition = "output.has_query_results",
-                       fluidRow(
-                         column(3,
-                                uiOutput("date_column_ui")
-                         ),
-                         column(3,
-                                uiOutput("value_column_ui")
-                         ),
-                         column(3,
-                                numericInput("forecast_periods", "Forecast Periods:", 
-                                             value = 30, min = 1, max = 365)
-                         ),
-                         column(3,
-                                checkboxInput("yearly_seasonality", "Yearly Seasonality", value = TRUE),
-                                checkboxInput("weekly_seasonality", "Weekly Seasonality", value = TRUE)
-                         )
-                       ),
-                       hr(),
-                       div(
-                         class = "text-center",
-                         actionButton("run_forecast_btn", "Run Forecast", icon = icon("chart-line"), 
-                                      class = "btn-primary"),
-                         conditionalPanel(
-                           condition = "input.run_forecast_btn > 0 && output.is_forecasting",
-                           div(
-                             style = "margin-top: 15px;",
-                             p("Generating forecast..."),
-                             div(class = "progress-striped active",
-                                 div(class = "progress-bar progress-bar-info", 
-                                     style = "width: 100%"))
-                           )
-                         )
-                       ),
-                       hr(),
-                       plotlyOutput("prophet_plot", height = "600px"),
-                       DT::dataTableOutput("forecast_table")
-                     ),
-                     conditionalPanel(
-                       condition = "!output.has_query_results",
-                       div(
-                         style = "text-align: center; padding: 30px; color: #6c757d;",
-                         icon("info-circle", style = "font-size: 48px;"),
-                         h4("No Data Available"),
-                         p("Run a SQL query with date/time and numeric columns first to use the forecasting tool.")
-                       )
-                     )
-                   )),
-          tabPanel("Query History",
-                   box(
-                     width = 12,
-                     h4("Recently Executed Queries"),
+                     
+                     DT::dataTableOutput("forecast_table")
+                   ),
+                   conditionalPanel(
+                     condition = "!output.has_query_results",
                      div(
-                       style = "margin-bottom: 10px;",
-                       actionButton("clear_history_btn", "Clear History", 
-                                    icon = icon("trash"), class = "btn-sm btn-danger"),
-                       actionButton("rerun_query_btn", "Rerun Selected Query", 
-                                    icon = icon("redo"), class = "btn-sm btn-info")
-                     ),
-                     DTOutput("query_history_table")
-                   )),
-          tabPanel("Help",
-                   box(
-                     width = 12,
-                     h4("DuckDB SQL Query Interface Help"),
-                     tags$ul(
-                       tags$li(tags$b("Connection:"), "Connect to an in-memory database or a file-based DuckDB database."),
-                       tags$li(tags$b("Database Explorer:"), "Browse schemas and tables in your connected database."),
-                       tags$li(tags$b("SQL Queries:"), "Enter SQL queries in the text area and click 'Run Query'.")
-                     ),
-                     
-                     h4("SQL Reference"),
-                     tags$ul(
-                       tags$li(tags$b("Basic Queries:"), 
-                               tags$ul(
-                                 tags$li(
-                                   HTML("<code><span style='color:#D73A49;font-weight:bold;'>SELECT</span> * <span style='color:#D73A49;font-weight:bold;'>FROM</span> sqlite_master;</code>")
-                                 ),
-                                 tags$li(
-                                   HTML("<code><span style='color:#D73A49;font-weight:bold;'>CREATE TABLE</span> tablename (<span style='color:#6F42C1;'>col1</span> <span style='color:#005CC5;'>INT</span>, <span style='color:#6F42C1;'>col2</span> <span style='color:#005CC5;'>VARCHAR</span>);</code>")
-                                 ),
-                                 tags$li(
-                                   HTML("<code><span style='color:#D73A49;font-weight:bold;'>INSERT INTO</span> tablename <span style='color:#D73A49;font-weight:bold;'>VALUES</span> (1, <span style='color:#032F62;'>'value'</span>);</code>")
-                                 ),
-                                 tags$li(
-                                   HTML("<code><span style='color:#D73A49;font-weight:bold;'>SELECT</span> * <span style='color:#D73A49;font-weight:bold;'>FROM</span> tablename <span style='color:#D73A49;font-weight:bold;'>WHERE</span> condition;</code>")
-                                 )
+                       style = "text-align: center; padding: 30px; color: #6c757d;",
+                       icon("info-circle", style = "font-size: 48px;"),
+                       h4("No Data Available"),
+                       p("Run a SQL query with date/time and numeric columns first to use the forecasting tool.")
+                     )
+                   )
+                 )),
+        
+        # Query History Tab
+        tabPanel("Query History",
+                 box(
+                   width = 12,
+                   h4("Recently Executed Queries"),
+                   div(
+                     style = "margin-bottom: 10px;",
+                     actionButton("clear_history_btn", "Clear History", 
+                                  icon = icon("trash"), class = "btn-sm btn-danger"),
+                     actionButton("rerun_query_btn", "Rerun Selected Query", 
+                                  icon = icon("redo"), class = "btn-sm btn-info")
+                   ),
+                   DTOutput("query_history_table")
+                 )),
+        
+        # Help Tab
+        tabPanel("Help",
+                 box(
+                   width = 12,
+                   h4("DuckDB SQL Query Interface Help"),
+                   tags$ul(
+                     tags$li(tags$b("Connection:"), "Connect to an in-memory database or a file-based DuckDB database."),
+                     tags$li(tags$b("Database Explorer:"), "Browse schemas and tables in your connected database."),
+                     tags$li(tags$b("SQL Queries:"), "Enter SQL queries in the text area and click 'Run Query'.")
+                   ),
+                   
+                   h4("SQL Reference"),
+                   tags$ul(
+                     tags$li(tags$b("Basic Queries:"), 
+                             tags$ul(
+                               tags$li(
+                                 HTML("<code><span style='color:#D73A49;font-weight:bold;'>SELECT</span> * <span style='color:#D73A49;font-weight:bold;'>FROM</span> sqlite_master;</code>")
+                               ),
+                               tags$li(
+                                 HTML("<code><span style='color:#D73A49;font-weight:bold;'>CREATE TABLE</span> tablename (<span style='color:#6F42C1;'>col1</span> <span style='color:#005CC5;'>INT</span>, <span style='color:#6F42C1;'>col2</span> <span style='color:#005CC5;'>VARCHAR</span>);</code>")
+                               ),
+                               tags$li(
+                                 HTML("<code><span style='color:#D73A49;font-weight:bold;'>INSERT INTO</span> tablename <span style='color:#D73A49;font-weight:bold;'>VALUES</span> (1, <span style='color:#032F62;'>'value'</span>);</code>")
+                               ),
+                               tags$li(
+                                 HTML("<code><span style='color:#D73A49;font-weight:bold;'>SELECT</span> * <span style='color:#D73A49;font-weight:bold;'>FROM</span> tablename <span style='color:#D73A49;font-weight:bold;'>WHERE</span> condition;</code>")
                                )
-                       ),
-                       tags$li(tags$b("Working with Spaces in Names:"), 
-                               tags$ul(
-                                 tags$li(
-                                   HTML("<code><span style='color:#D73A49;font-weight:bold;'>SELECT</span> * <span style='color:#D73A49;font-weight:bold;'>FROM</span> <span style='color:#032F62;'>\"My Table\"</span>;</code>")
-                                 ),
-                                 tags$li(
-                                   HTML("<code><span style='color:#D73A49;font-weight:bold;'>SELECT</span> <span style='color:#032F62;'>\"First Name\"</span>, <span style='color:#032F62;'>\"Last Name\"</span> <span style='color:#D73A49;font-weight:bold;'>FROM</span> customers;</code>")
-                                 ),
-                                 tags$li(
-                                   HTML("<code><span style='color:#D73A49;font-weight:bold;'>SELECT</span> t.<span style='color:#032F62;'>\"Product Name\"</span> <span style='color:#D73A49;font-weight:bold;'>FROM</span> <span style='color:#032F62;'>\"Product Items\"</span> t;</code>")
-                                 ),
-                                 tags$li(
-                                   HTML("<code><span style='color:#D73A49;font-weight:bold;'>SELECT</span> c.name, o.<span style='color:#032F62;'>\"order date\"</span> <span style='color:#D73A49;font-weight:bold;'>FROM</span> customers c <span style='color:#D73A49;font-weight:bold;'>JOIN</span> <span style='color:#032F62;'>\"Order Details\"</span> o <span style='color:#D73A49;font-weight:bold;'>ON</span> c.id = o.customer_id;</code>")
-                                 )
+                             )
+                     ),
+                     tags$li(tags$b("Working with Spaces in Names:"), 
+                             tags$ul(
+                               tags$li(
+                                 HTML("<code><span style='color:#D73A49;font-weight:bold;'>SELECT</span> * <span style='color:#D73A49;font-weight:bold;'>FROM</span> <span style='color:#032F62;'>\"My Table\"</span>;</code>")
+                               ),
+                               tags$li(
+                                 HTML("<code><span style='color:#D73A49;font-weight:bold;'>SELECT</span> <span style='color:#032F62;'>\"First Name\"</span>, <span style='color:#032F62;'>\"Last Name\"</span> <span style='color:#D73A49;font-weight:bold;'>FROM</span> customers;</code>")
+                               ),
+                               tags$li(
+                                 HTML("<code><span style='color:#D73A49;font-weight:bold;'>SELECT</span> t.<span style='color:#032F62;'>\"Product Name\"</span> <span style='color:#D73A49;font-weight:bold;'>FROM</span> <span style='color:#032F62;'>\"Product Items\"</span> t;</code>")
+                               ),
+                               tags$li(
+                                 HTML("<code><span style='color:#D73A49;font-weight:bold;'>SELECT</span> c.name, o.<span style='color:#032F62;'>\"order date\"</span> <span style='color:#D73A49;font-weight:bold;'>FROM</span> customers c <span style='color:#D73A49;font-weight:bold;'>JOIN</span> <span style='color:#032F62;'>\"Order Details\"</span> o <span style='color:#D73A49;font-weight:bold;'>ON</span> c.id = o.customer_id;</code>")
                                )
-                       ),
-                       tags$li(tags$b("Case Sensitivity:"), "DuckDB identifiers are case-insensitive by default, but become case-sensitive when quoted."),
-                       tags$li(tags$b("Special Characters:"), "Use double quotes for any identifier with spaces, special characters, or to preserve case sensitivity.")
+                             )
                      ),
-                     
-                     h4("Importing Data"),
-                     tags$ul(
-                       tags$li(tags$b("CSV Import:"), "Upload a CSV file and specify a table name to import data."),
-                       tags$li(tags$b("Parquet Import:"), "Upload a Parquet file and specify a table name to import data."),
-                       tags$li(tags$b("Excel Import:"), "Upload an Excel file (.xlsx or .xls) and specify a table name to import data. You can optionally specify a sheet name.")
-                     ),
-                     
-                     h4("SQL Editor Keyboard Shortcuts"),
-                     tags$ul(
-                       tags$li(tags$b("Run Query:"), "Ctrl+Enter"),
-                       tags$li(tags$b("Format SQL:"), "Click the 'Format SQL' button to beautify your query"),
-                       tags$li(tags$b("Auto-complete:"), "Ctrl+Space to trigger auto-completion")
-                     ),
-                     
-                     h4("Advanced Analysis Features"),
-                     tags$ul(
-                       tags$li(tags$b("Pivot Table:"), "Create interactive pivot tables and charts from your query results. Drag and drop columns to pivot, filter, and aggregate your data."),
-                       tags$li(tags$b("Data Visualization:"), "Use interactive charts to visualize your query results. Choose from various chart types and apply filtering and grouping."),
-                       tags$li(tags$b("Summary Statistics:"), "Calculate statistical measures like sum, count, median, mean, and standard deviation for numeric data columns."),
-                       tags$li(tags$b("Esquisse:"), "Build custom ggplot2 visualizations using an intuitive drag-and-drop interface. Perfect for creating publication-quality graphics."),
-                       tags$li(tags$b("Prophet:"), "Perform time series forecasting on your data using Facebook's Prophet algorithm. Predict future values based on historical patterns.")
-                     ),
-                     
-                     h4("Examples with Spaces in Names"),
-                     tags$div(
-                       class = "sql-example-container",
-                       style = "background-color: #f8f9fa; padding: 15px; border-radius: 4px; font-family: monospace; overflow-x: auto;",
-                       HTML("
+                     tags$li(tags$b("Case Sensitivity:"), "DuckDB identifiers are case-insensitive by default, but become case-sensitive when quoted."),
+                     tags$li(tags$b("Special Characters:"), "Use double quotes for any identifier with spaces, special characters, or to preserve case sensitivity.")
+                   ),
+                   
+                   h4("Importing Data"),
+                   tags$ul(
+                     tags$li(tags$b("CSV Import:"), "Upload a CSV file and specify a table name to import data."),
+                     tags$li(tags$b("Parquet Import:"), "Upload a Parquet file and specify a table name to import data."),
+                     tags$li(tags$b("Excel Import:"), "Upload an Excel file (.xlsx or .xls) and specify a table name to import data. You can optionally specify a sheet name.")
+                   ),
+                   
+                   h4("SQL Editor Keyboard Shortcuts"),
+                   tags$ul(
+                     tags$li(tags$b("Run Query:"), "Ctrl+Enter"),
+                     tags$li(tags$b("Format SQL:"), "Click the 'Format SQL' button to beautify your query"),
+                     tags$li(tags$b("Auto-complete:"), "Ctrl+Space to trigger auto-completion")
+                   ),
+                   
+                   h4("Advanced Analysis Features"),
+                   tags$ul(
+                     tags$li(tags$b("Pivot Table:"), "Create interactive pivot tables and charts from your query results. Drag and drop columns to pivot, filter, and aggregate your data."),
+                     tags$li(tags$b("Data Visualization:"), "Use interactive charts to visualize your query results. Choose from various chart types and apply filtering and grouping."),
+                     tags$li(tags$b("Summary Statistics:"), "Calculate statistical measures like sum, count, median, mean, and standard deviation for numeric data columns."),
+                     tags$li(tags$b("Esquisse:"), "Build custom ggplot2 visualizations using an intuitive drag-and-drop interface. Perfect for creating publication-quality graphics."),
+                     tags$li(tags$b("Prophet:"), "Perform time series forecasting on your data using Facebook's Prophet algorithm. Predict future values based on historical patterns.")
+                   ),
+                   
+                   h4("Examples with Spaces in Names"),
+                   tags$div(
+                     class = "sql-example-container",
+                     style = "background-color: #f8f9fa; padding: 15px; border-radius: 4px; font-family: monospace; overflow-x: auto;",
+                     HTML("
                        <div><span style='color:#6A737D;'>-- Select from a table with spaces in its name</span></div>
                        <div><span style='color:#D73A49;font-weight:bold;'>SELECT</span> * <span style='color:#D73A49;font-weight:bold;'>FROM</span> <span style='color:#032F62;'>\"My Table\"</span>;</div>
                        <br>
@@ -563,10 +718,9 @@ ui <- fluidPage(
                        <div><span style='color:#D73A49;font-weight:bold;'>JOIN</span> <span style='color:#032F62;'>\"Products\"</span> p <span style='color:#D73A49;font-weight:bold;'>ON</span> o.<span style='color:#032F62;'>\"Product ID\"</span> = p.<span style='color:#032F62;'>\"Product ID\"</span></div>
                        <div><span style='color:#D73A49;font-weight:bold;'>ORDER BY</span> o.<span style='color:#032F62;'>\"Order Date\"</span>;</div>
                      ")
-                     )
-                   ))
-        )
-    )
+                   )
+                 ))
+      )
   )
 )
 
@@ -985,8 +1139,8 @@ server <- function(input, output, session) {
         stringsAsFactors = FALSE
       ), values$query_history)
       
-      # Switch to results tab
-      updateTabsetPanel(session, "main_tabs", selected = "Results")
+      # Stay on the Query Editor tab to show results
+      # (No need to switch tabs, results are already visible)
       
     }, error = function(e) {
       values$status <- paste0("Error executing query: ", e$message)
@@ -1705,89 +1859,361 @@ server <- function(input, output, session) {
     
     # Prepare data for Prophet
     tryCatch({
-      # Create data frame with required 'ds' and 'y' columns
+      # Keep original raw data for reference
+      date_column_raw <- values$query_result[[input$date_column]]
+      
+      # Print debugging for date column
+      print(paste("Date column type:", class(date_column_raw)[1]))
+      print(paste("First few date values:", paste(head(date_column_raw), collapse=", ")))
+      
+      # Create data frame with required 'ds' and 'y' columns for Prophet
+      # Try multiple methods to ensure proper date conversion
       prophet_data <- data.frame(
-        ds = values$query_result[[input$date_column]],
-        y = values$query_result[[input$value_column]]
+        ds = NA,  # Will be filled with proper dates
+        y = as.numeric(values$query_result[[input$value_column]])
       )
       
-      # Convert ds to Date if it's not already
-      if(!inherits(prophet_data$ds, "Date")) {
-        tryCatch({
-          prophet_data$ds <- as.Date(prophet_data$ds, format = "%Y-%m-%d")
-        }, error = function(e) {
-          # Try alternative formats if the default fails
-          tryCatch({
-            prophet_data$ds <- as.Date(prophet_data$ds, format = "%m/%d/%Y")
+      # First attempt - try as_datetime then convert to Date
+      prophet_data$ds <- tryCatch({
+        as.Date(lubridate::as_datetime(date_column_raw))
+      }, error = function(e) {
+        # Return NA on error - we'll try other methods
+        rep(NA, length(date_column_raw))
+      })
+      
+      # If first attempt failed, try direct Date conversion with various formats
+      if (all(is.na(prophet_data$ds))) {
+        date_formats <- c("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d", "%d-%m-%Y", "%m-%d-%Y")
+        
+        for (format in date_formats) {
+          prophet_data$ds <- tryCatch({
+            as.Date(date_column_raw, format = format)
           }, error = function(e) {
-            tryCatch({
-              prophet_data$ds <- as.Date(prophet_data$ds, format = "%d-%m-%Y")
-            }, error = function(e) {
-              # Final attempt with lubridate
-              if(requireNamespace("lubridate", quietly = TRUE)) {
-                prophet_data$ds <- lubridate::parse_date_time(prophet_data$ds, orders = c("ymd", "mdy", "dmy"))
-              }
-            })
+            # Continue with next format if this one fails
+            prophet_data$ds
           })
+          
+          # Break out of loop if conversion was successful
+          if (!all(is.na(prophet_data$ds))) {
+            print(paste("Successful date conversion with format:", format))
+            break
+          }
+        }
+      }
+      
+      # Last resort - try lubridate's flexible parser
+      if (all(is.na(prophet_data$ds))) {
+        prophet_data$ds <- tryCatch({
+          as.Date(lubridate::parse_date_time(date_column_raw, orders = c("ymd", "mdy", "dmy", "ymd HMS", "mdy HMS", "dmy HMS")))
+        }, error = function(e) {
+          # If this fails, we'll handle it below
+          prophet_data$ds
         })
       }
       
-      # Check if conversion was successful
-      if(any(is.na(prophet_data$ds))) {
-        values$status <- "Error: Could not convert date column to Date format. Try a different column."
+      # Final check for valid dates
+      if (all(is.na(prophet_data$ds))) {
+        values$status <- paste0("Error: Could not convert date column '", input$date_column, 
+                                "' to valid dates. Please select a different column or fix date format.")
+        print(paste("Date conversion failed. Sample values:", paste(head(date_column_raw), collapse=", ")))
         values$forecasting <- FALSE
         return(NULL)
       }
       
-      # Remove rows with NA values
+      # Check for partial date conversion failure
+      if (any(is.na(prophet_data$ds))) {
+        valid_count <- sum(!is.na(prophet_data$ds))
+        total_count <- length(prophet_data$ds)
+        print(paste("Partial date conversion:", valid_count, "out of", total_count, "dates successfully converted"))
+        
+        # Remove NA values
+        prophet_data <- prophet_data[!is.na(prophet_data$ds), ]
+        
+        # Check if we have enough data left
+        if (nrow(prophet_data) < 2) {
+          values$status <- paste0("Error: After removing invalid dates, only ", nrow(prophet_data), 
+                                  " valid date(s) remain. Need at least 2 data points.")
+          values$forecasting <- FALSE
+          return(NULL)
+        }
+      }
+      
+      # Remove rows with NA values in either column
       prophet_data <- na.omit(prophet_data)
       
-      # Check if we have enough data
-      if(nrow(prophet_data) < 2) {
-        values$status <- "Error: Not enough valid data points for forecasting."
+      # Check if we have enough data points
+      if (nrow(prophet_data) < 2) {
+        values$status <- "Error: Not enough valid data points for forecasting (need at least 2)."
         values$forecasting <- FALSE
         return(NULL)
       }
       
-      # Create and fit Prophet model
+      # Sort data by date (required for Prophet)
+      prophet_data <- prophet_data[order(prophet_data$ds), ]
+      
+      # Verify date range
+      min_date <- min(prophet_data$ds)
+      max_date <- max(prophet_data$ds)
+      date_range <- as.numeric(difftime(max_date, min_date, units = "days"))
+      
+      print(paste("Date range:", date_range, "days"))
+      print(paste("Min date:", min_date))
+      print(paste("Max date:", max_date))
+      
+      # Handle zero date range by adding a small offset
+      if (date_range <= 0) {
+        # All dates are the same - add a small offset for the last point
+        if (nrow(prophet_data) > 1) {
+          print("Detected zero date range. Attempting to add artificial date spread.")
+          # Make a copy of the data with dates spread out by 1 day increments
+          date_seq <- seq(as.Date(min_date), as.Date(min_date) + nrow(prophet_data) - 1, by = "day")
+          
+          # Create a new data frame with spread-out dates
+          spread_data <- prophet_data
+          spread_data$ds <- date_seq
+          
+          # Print what we're doing
+          print(paste("Created artificial date range from", min(date_seq), "to", max(date_seq)))
+          
+          # Use the spread data instead
+          prophet_data <- spread_data
+          
+          # Recalculate date range
+          date_range <- as.numeric(difftime(max(prophet_data$ds), min(prophet_data$ds), units = "days"))
+          print(paste("New date range:", date_range, "days"))
+          
+          # Warn the user that we're using artificial dates
+          values$status <- paste("Warning: All dates in your data were the same. Using artificial date range for forecasting.")
+        } else {
+          values$status <- "Error: Invalid date range. All dates are the same and there is only one data point."
+          values$forecasting <- FALSE
+          return(NULL)
+        }
+      }
+      
+      # Print debugging information
+      print(paste("Forecast input:", nrow(prophet_data), "rows"))
+      print(paste("Date range:", min(prophet_data$ds), "to", max(prophet_data$ds), 
+                  "(", date_range, "days)"))
+      print(paste("Value range:", min(prophet_data$y), "to", max(prophet_data$y),
+                  "std dev:", sd(prophet_data$y)))
+      
+      # Data preprocessing if enabled
+      if(input$data_preprocessing) {
+        # Handle missing values if any
+        if(any(is.na(prophet_data$y))) {
+          prophet_data <- prophet_data[!is.na(prophet_data$y), ]
+          print(paste("Removed", sum(is.na(prophet_data$y)), "rows with missing values"))
+        }
+        
+        # Outlier removal if enabled
+        if(input$remove_outliers) {
+          print("Removing outliers...")
+          # Calculate IQR for outlier detection
+          q1 <- quantile(prophet_data$y, 0.25)
+          q3 <- quantile(prophet_data$y, 0.75)
+          iqr <- q3 - q1
+          lower_bound <- q1 - 1.5 * iqr
+          upper_bound <- q3 + 1.5 * iqr
+          
+          # Filter out outliers
+          outlier_count <- sum(prophet_data$y < lower_bound | prophet_data$y > upper_bound)
+          prophet_data <- prophet_data[prophet_data$y >= lower_bound & prophet_data$y <= upper_bound, ]
+          print(paste("Removed", outlier_count, "outliers"))
+        }
+        
+        # Ensure we still have enough data
+        if(nrow(prophet_data) < 2) {
+          values$status <- "Error: Not enough data points after preprocessing."
+          values$forecasting <- FALSE
+          return(NULL)
+        }
+      }
+      
+      # Prepare logistic growth cap/floor if needed
+      growth_params <- list()
+      if(input$growth == "logistic") {
+        # Add capacity cap
+        prophet_data$cap <- input$cap
+        growth_params$cap <- input$cap
+      }
+      
+      # Create and fit Prophet model with appropriate parameters
       m <- prophet::prophet(
         prophet_data,
-        yearly.seasonality = input$yearly_seasonality,
-        weekly.seasonality = input$weekly_seasonality
+        growth = input$growth,
+        changepoint.prior.scale = input$changepoint_prior_scale,
+        seasonality.prior.scale = input$seasonality_prior_scale,
+        changepoint.range = input$changepoint_range,
+        n.changepoints = input$n_changepoints,
+        yearly.seasonality = if(date_range > 360) input$yearly_seasonality else FALSE,
+        weekly.seasonality = if(date_range > 14) input$weekly_seasonality else FALSE,
+        daily.seasonality = input$daily_seasonality,
+        seasonality.mode = input$seasonality_mode,
+        uncertainty.samples = 1000
       )
+      
+      # Add custom seasonality if needed
+      if(input$daily_seasonality && exists("daily_seasonality_fourier")) {
+        m <- prophet::add_seasonality(m, 
+                                      name = 'daily', 
+                                      period = 1, 
+                                      fourier.order = input$daily_seasonality_fourier)
+      }
       
       # Create future dataframe for prediction
       future <- prophet::make_future_dataframe(m, periods = input$forecast_periods)
       
-      # Make prediction
-      forecast <- prophet::predict(m, future)
+      # Add cap for logistic growth if needed
+      if(input$growth == "logistic") {
+        future$cap <- input$cap
+      }
       
-      # Ensure we have proper data structure for plotting
+      # Make prediction with the model
+      # The proper way to get predictions from a prophet model
+      forecast <- tryCatch({
+        # Use an alternative approach - directly access the predict function from the prophet model
+        if ("predict" %in% getNamespaceExports("prophet")) {
+          # If predict is exported from prophet, use it
+          prophet::predict(m, future)
+        } else if ("predictive_samples" %in% getNamespaceExports("prophet")) {
+          # If predictive_samples is available, use that instead
+          print("Using predictive_samples approach")
+          samples <- prophet::predictive_samples(m, future)
+          
+          # Extract predictions and confidence intervals
+          yhat <- apply(samples$samples, 2, mean)
+          yhat_lower <- apply(samples$samples, 2, function(x) quantile(x, 0.025))
+          yhat_upper <- apply(samples$samples, 2, function(x) quantile(x, 0.975))
+          
+          # Create a data frame similar to what predict would return
+          data.frame(
+            ds = future$ds,
+            yhat = yhat,
+            yhat_lower = yhat_lower,
+            yhat_upper = yhat_upper
+          )
+        } else {
+          # Fall back to standard S3 method
+          predict(m, future)
+        }
+      }, error = function(e) {
+        print(paste("First prediction attempt failed:", e$message))
+        
+        # Try with the generic predict if available
+        tryCatch({
+          predict(m, future)
+        }, error = function(e2) {
+          print(paste("Second prediction attempt failed:", e2$message))
+          NULL
+        })
+      })
+      
+      # If still an error, try one more approach
+      if(is.null(forecast) || inherits(forecast, "try-error")) {
+        # Try loading the specific predict method for prophet models
+        # This is a last-resort hack, but might work in some cases
+        tryCatch({
+          print("Trying alternate prediction method...")
+          
+          if (exists("prophet_fit", where = asNamespace("prophet"))) {
+            print("Using prophet_fit method")
+            fitted <- asNamespace("prophet")$prophet_fit(m, prophet_data)
+            predicted <- asNamespace("prophet")$prophet_predict(fitted, future)
+            forecast <- predicted
+          } else if (exists("fit.prophet", where = asNamespace("prophet"))) {
+            print("Using fit.prophet method")
+            predict_fn <- get("fit.prophet", asNamespace("prophet"))
+            forecast <- predict_fn(m, future)
+          } else {
+            # Last approach - check if we can find the right methods
+            print("Trying generic prediction with available methods")
+            methods_available <- methods(class = class(m)[1])
+            print(paste("Available methods:", paste(methods_available, collapse=", ")))
+            
+            if ("predict.prophet" %in% methods_available) {
+              forecast <- predict.prophet(m, future)
+            } else {
+              print("No suitable prediction method found")
+              forecast <- NULL
+            }
+          }
+        }, error = function(e) {
+          print(paste("Final prediction attempt failed:", e$message))
+          forecast <- NULL
+        })
+      }
+      
+      # If we still don't have a forecast, report error
+      if(is.null(forecast) || inherits(forecast, "try-error")) {
+        values$status <- "Error: Could not generate forecast. See logs for details."
+        values$forecasting <- FALSE
+        return(NULL)
+      }
+      
+      # Ensure we have a reasonable forecast
       if(nrow(forecast) <= nrow(prophet_data)) {
         values$status <- "Error: Forecast couldn't be generated beyond input data."
         values$forecasting <- FALSE
         return(NULL)
       }
       
-      # Prepare data for plots - create a data frame suitable for plotly
+      # Calculate model performance metrics on the training data
+      # This helps users understand the model's accuracy
+      fitted_values <- forecast$yhat[1:nrow(prophet_data)]
+      actual_values <- prophet_data$y
+      
+      # Calculate common error metrics
+      rmse <- sqrt(mean((fitted_values - actual_values)^2, na.rm = TRUE))
+      mae <- mean(abs(fitted_values - actual_values), na.rm = TRUE)
+      mape <- 100 * mean(abs((actual_values - fitted_values) / actual_values), na.rm = TRUE)
+      
+      # Store metrics for display
+      values$forecast_metrics <- list(
+        rmse = rmse,
+        mae = mae,
+        mape = mape
+      )
+      
+      print(paste("Model metrics - RMSE:", round(rmse, 2), 
+                  "MAE:", round(mae, 2), 
+                  "MAPE:", round(mape, 2), "%"))
+      
+      # Prepare data for plots with proper structure for plotly
       actual_data <- data.frame(
         date = prophet_data$ds,
         value = prophet_data$y,
         type = "Actual"
       )
       
+      # Only include future dates in forecast portion
+      forecast_indices <- which(forecast$ds > max(prophet_data$ds))
+      if(length(forecast_indices) == 0) {
+        values$status <- "Error: No future dates in forecast."
+        values$forecasting <- FALSE
+        return(NULL)
+      }
+      
       forecast_data <- data.frame(
-        date = forecast$ds[(nrow(prophet_data) + 1):nrow(forecast)],
-        value = forecast$yhat[(nrow(prophet_data) + 1):nrow(forecast)],
+        date = forecast$ds[forecast_indices],
+        value = forecast$yhat[forecast_indices],
         type = "Forecast"
       )
       
-      plot_data <- rbind(actual_data, forecast_data)
+      # Also include confidence intervals
+      forecast_data$lower <- forecast$yhat_lower[forecast_indices]
+      forecast_data$upper <- forecast$yhat_upper[forecast_indices]
       
-      # Create forecast table for display
-      forecast_table <- forecast %>%
+      # Combine for plotting
+      plot_data <- rbind(
+        actual_data,
+        # Just use the needed columns for the binding
+        forecast_data[, c("date", "value", "type")]
+      )
+      
+      # Create forecast table for display with formatted date
+      forecast_table <- forecast[forecast_indices, ] %>%
         dplyr::select(ds, yhat, yhat_lower, yhat_upper) %>%
-        dplyr::filter(ds >= max(prophet_data$ds)) %>%
         dplyr::rename(
           Date = ds,
           Forecast = yhat,
@@ -1797,13 +2223,30 @@ server <- function(input, output, session) {
       
       # Store results in reactive values
       values$prophet_plot_data <- plot_data
+      values$prophet_forecast_data <- forecast_data  # Store with confidence intervals
       values$prophet_forecast_table <- forecast_table
+      values$prophet_model <- m  # Store the full model for component plots
+      values$full_forecast <- forecast  # Store full forecast with components
       
       values$status <- "Forecast generated successfully."
       values$forecasting <- FALSE
       
     }, error = function(e) {
       print(paste("Prophet forecasting error:", e$message))
+      traceback()  # Print the full error trace for debugging
+      
+      # Print information about the prophet package
+      print("Prophet package information:")
+      print(packageVersion("prophet"))
+      print("Prophet namespace exports:")
+      print(getNamespaceExports("prophet"))
+      
+      # Check if required functions exist
+      print("Prophet functions check:")
+      print(paste("prophet function exists:", exists("prophet", where = asNamespace("prophet"))))
+      print(paste("predict method exists for prophet class:", 
+                  "prophet" %in% rownames(methods(predict))))
+      
       values$status <- paste0("Error in forecasting: ", e$message)
       values$forecasting <- FALSE
     })
@@ -1830,32 +2273,73 @@ server <- function(input, output, session) {
                layout(title = "Error: Missing actual or forecast data"))
     }
     
-    # Create plot with separate traces
-    p <- plot_ly() %>%
-      add_trace(
-        data = actual_data,
-        x = ~date, 
-        y = ~value,
-        type = "scatter",
-        mode = "markers+lines",
-        name = "Actual",
-        marker = list(color = "blue")
-      ) %>%
-      add_trace(
-        data = forecast_data,
-        x = ~date, 
-        y = ~value,
-        type = "scatter",
-        mode = "lines",
-        name = "Forecast",
-        line = list(color = "red")
-      ) %>%
-      layout(
-        title = "Time Series Forecast",
-        xaxis = list(title = "Date"),
-        yaxis = list(title = input$value_column),
+    # Create base plot
+    p <- plot_ly() 
+    
+    # Add actual data trace
+    p <- p %>% add_trace(
+      data = actual_data,
+      x = ~date, 
+      y = ~value,
+      type = "scatter",
+      mode = "markers+lines",
+      name = "Actual",
+      marker = list(color = "blue", size = 5)
+    )
+    
+    # Add forecast trace
+    p <- p %>% add_trace(
+      data = forecast_data,
+      x = ~date, 
+      y = ~value,
+      type = "scatter",
+      mode = "lines",
+      name = "Forecast",
+      line = list(color = "red", width = 2)
+    )
+    
+    # Add confidence interval if available
+    if(exists("prophet_forecast_data", values) && 
+       !is.null(values$prophet_forecast_data) &&
+       "lower" %in% colnames(values$prophet_forecast_data) &&
+       "upper" %in% colnames(values$prophet_forecast_data)) {
+      
+      ci_data <- values$prophet_forecast_data
+      
+      # Add confidence interval as a filled area
+      p <- p %>% add_ribbons(
+        data = ci_data,
+        x = ~date,
+        ymin = ~lower,
+        ymax = ~upper,
+        name = "95% Confidence",
+        fillcolor = "rgba(255, 0, 0, 0.2)",
+        line = list(color = "transparent"),
         showlegend = TRUE
       )
+    }
+    
+    # Enhance layout
+    p <- p %>% layout(
+      title = "Time Series Forecast",
+      xaxis = list(
+        title = "Date",
+        rangeselector = list(
+          buttons = list(
+            list(count = 1, label = "1m", step = "month", stepmode = "backward"),
+            list(count = 6, label = "6m", step = "month", stepmode = "backward"),
+            list(count = 1, label = "1y", step = "year", stepmode = "backward"),
+            list(step = "all")
+          )
+        ),
+        rangeslider = list(type = "date"),
+        type = "date"
+      ),
+      yaxis = list(title = input$value_column),
+      showlegend = TRUE,
+      hoverlabel = list(bgcolor = "white", font = list(size = 12)),
+      hovermode = "closest"
+    )
     
     return(p)
   })
@@ -1872,6 +2356,96 @@ server <- function(input, output, session) {
               ),
               rownames = FALSE) %>%
       formatRound(columns = c("Forecast", "Lower_Bound", "Upper_Bound"), digits = 2)
+  })
+  
+  # Render forecast metrics
+  output$forecast_metrics <- renderUI({
+    req(values$forecast_metrics)
+    
+    metrics <- values$forecast_metrics
+    
+    fluidRow(
+      column(12,
+             h4("Forecast Accuracy Metrics"),
+             p("These metrics indicate how well the model fits the historical data. Lower values indicate better accuracy.")
+      ),
+      column(4,
+             div(class = "summary-stats",
+                 div(class = "summary-value", round(metrics$rmse, 2)),
+                 div(class = "summary-label", "RMSE (Root Mean Square Error)")
+             )
+      ),
+      column(4,
+             div(class = "summary-stats",
+                 div(class = "summary-value", round(metrics$mae, 2)),
+                 div(class = "summary-label", "MAE (Mean Absolute Error)")
+             )
+      ),
+      column(4,
+             div(class = "summary-stats",
+                 div(class = "summary-value", paste0(round(metrics$mape, 2), "%")),
+                 div(class = "summary-label", "MAPE (Mean Absolute Percentage Error)")
+             )
+      )
+    )
+  })
+  
+  # Render Prophet component plots
+  output$prophet_components <- renderPlotly({
+    req(values$prophet_plot_data, values$prophet_forecast_data, input$show_components)
+    
+    # Component plots are only available if we have the full Prophet model components
+    if(!exists("prophet_model", values) || is.null(values$prophet_model)) {
+      return(plot_ly() %>% 
+               layout(title = "Component plots unavailable. Re-run forecast to generate components."))
+    }
+    
+    # Extract components from the forecast
+    m <- values$prophet_model
+    forecast <- values$full_forecast
+    
+    # Check if components are available
+    if(!all(c("trend", "yearly", "weekly") %in% colnames(forecast))) {
+      # If components aren't available yet, generate plot showing this
+      return(plot_ly() %>% 
+               layout(title = "Component data not available for this forecast."))
+    }
+    
+    # Create subplot with trend, yearly and weekly components if available
+    plot_list <- list()
+    
+    # Trend component
+    trend_plot <- plot_ly(data = forecast, x = ~ds, y = ~trend, 
+                          type = "scatter", mode = "lines", name = "Trend") %>%
+      layout(title = "Trend Component", showlegend = FALSE)
+    plot_list[[1]] <- trend_plot
+    
+    # Yearly seasonality if available
+    if("yearly" %in% colnames(forecast) && sum(!is.na(forecast$yearly)) > 0) {
+      yearly_data <- forecast[!duplicated(format(forecast$ds, "%m-%d")), ]
+      yearly_data <- yearly_data[order(format(yearly_data$ds, "%m-%d")), ]
+      
+      yearly_plot <- plot_ly(data = yearly_data, x = ~ds, y = ~yearly, 
+                             type = "scatter", mode = "lines", name = "Yearly") %>%
+        layout(title = "Yearly Seasonality", showlegend = FALSE)
+      plot_list[[length(plot_list) + 1]] <- yearly_plot
+    }
+    
+    # Weekly seasonality if available
+    if("weekly" %in% colnames(forecast) && sum(!is.na(forecast$weekly)) > 0) {
+      weekly_data <- forecast[!duplicated(format(forecast$ds, "%u")), ]
+      weekly_data <- weekly_data[order(format(weekly_data$ds, "%u")), ]
+      
+      weekly_plot <- plot_ly(data = weekly_data, x = ~ds, y = ~weekly, 
+                             type = "scatter", mode = "lines", name = "Weekly") %>%
+        layout(title = "Weekly Seasonality", showlegend = FALSE)
+      plot_list[[length(plot_list) + 1]] <- weekly_plot
+    }
+    
+    # Combine plots in a subplot
+    subplot(plot_list, nrows = length(plot_list), shareX = TRUE) %>%
+      layout(title = "Forecast Components",
+             showlegend = FALSE)
   })
 }
 
